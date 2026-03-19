@@ -5,8 +5,12 @@
 """
 
 import logging
+import os
 from typing import Dict, List, Any, Tuple, Optional
 import numpy as np
+
+os.environ.setdefault('HF_HOME', '/home/luwa/.cache/huggingface')
+
 import mteb
 import datasets
 from mteb._evaluators.retrieval_metrics import evaluate_p_mrr_change

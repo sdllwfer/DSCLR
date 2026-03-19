@@ -13,6 +13,7 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
+os.environ.setdefault('HF_HOME', '/home/luwa/.cache/huggingface')
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 
