@@ -31,3 +31,4 @@ env/
 *.swo
 *~
 evaluation/
+utils/construct_data/

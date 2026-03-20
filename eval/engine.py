@@ -4,11 +4,16 @@ FollowIR 评测引擎
 """
 
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+import random
 import sys
 import logging
 import time
 import json
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +26,51 @@ from eval.metrics import DataLoader as MetricsDataLoader, FollowIREvaluator
 from eval.output import OutputManager
 
 logger = logging.getLogger(__name__)
+
+
+def load_cached_embeddings(
+    cache_dir: str,
+    task_name: str
+) -> Optional[Tuple[torch.Tensor, List[str]]]:
+    """尝试加载缓存的文档向量"""
+    model_name_short = "bge-large-en"
+    cache_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
+    ids_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
+
+    if os.path.exists(cache_file) and os.path.exists(ids_file):
+        logger.info(f"📂 加载缓存的文档向量: {cache_file}")
+        embeddings = np.load(cache_file)
+        with open(ids_file, 'r') as f:
+            doc_ids = json.load(f)
+        logger.info(f"✅ 缓存加载成功: {len(doc_ids)} 个文档, shape={embeddings.shape}")
+        return torch.tensor(embeddings), doc_ids
+
+    logger.info(f"⚠️ 未找到缓存: {cache_file}")
+    return None
+
+
+def save_embeddings_cache(
+    cache_dir: str,
+    task_name: str,
+    embeddings: torch.Tensor,
+    doc_ids: List[str]
+) -> None:
+    """保存文档向量到缓存"""
+    os.makedirs(cache_dir, exist_ok=True)
+    model_name_short = "bge-large-en"
+    cache_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
+    ids_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
+
+    if isinstance(embeddings, torch.Tensor):
+        embeddings_np = embeddings.cpu().numpy()
+    else:
+        embeddings_np = embeddings
+
+    np.save(cache_file, embeddings_np)
+    with open(ids_file, 'w') as f:
+        json.dump(doc_ids, f)
+
+    logger.info(f"💾 文档向量已缓存: {cache_file}")
 
 
 class FollowIRDataLoader:
@@ -46,6 +96,10 @@ class FollowIRDataLoader:
                    f"{len(self.q_og)} og查询, {len(self.q_changed)} changed查询")
         
         return self.corpus, self.q_og, self.q_changed, self.candidates
+    
+    def load_raw_queries(self):
+        """加载原始 query 和 instruction"""
+        return self.metrics_loader.load_raw_queries()
     
     def get_query_count(self) -> Dict[str, int]:
         return {
@@ -78,7 +132,9 @@ class FollowIREvaluatorEngine:
         batch_size: int = 64,
         normalize_embeddings: bool = True,
         max_seq_length: Optional[int] = None,
-        seed: int = 42
+        seed: int = 42,
+        cache_dir: str = "dataset/FollowIR_test/embeddings",
+        use_cache: bool = True
     ):
         self.model_name = model_name
         self.task_name = task_name
@@ -88,6 +144,8 @@ class FollowIREvaluatorEngine:
         self.normalize_embeddings = normalize_embeddings
         self.max_seq_length = max_seq_length
         self.seed = seed
+        self.cache_dir = cache_dir
+        self.use_cache = use_cache
         
         self._setup_seed()
         self._init_components()
@@ -140,11 +198,30 @@ class FollowIREvaluatorEngine:
         logger.info(f"   changed 查询: {query_stats['changed_queries']}")
         logger.info(f"   候选文档: {candidate_stats['avg_per_query']:.0f} 个/查询")
         
-        logger.info("📚 编码候选文档...")
         all_doc_ids = self._get_all_candidate_doc_ids(candidates)
-        doc_texts = [corpus[did]['text'] for did in all_doc_ids]
         
-        self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
+        cached_data = None
+        if self.use_cache:
+            cached_data = load_cached_embeddings(self.cache_dir, self.task_name)
+        
+        if cached_data is not None:
+            cached_embeddings, cached_doc_ids = cached_data
+            if set(cached_doc_ids) == set(all_doc_ids):
+                logger.info(f"✅ 使用缓存的文档向量 ({len(cached_doc_ids)} 个)")
+                id_to_idx = {did: i for i, did in enumerate(cached_doc_ids)}
+                ordered_embeddings = torch.stack([cached_embeddings[id_to_idx[did]] for did in all_doc_ids])
+                self.retriever.set_embeddings(ordered_embeddings, all_doc_ids)
+            else:
+                logger.warning(f"⚠️ 缓存文档ID不匹配，重新编码...")
+                doc_texts = [corpus[did]['text'] for did in all_doc_ids]
+                self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
+                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
+        else:
+            logger.info("📚 编码候选文档...")
+            doc_texts = [corpus[did]['text'] for did in all_doc_ids]
+            self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
+            if self.use_cache:
+                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
         
         logger.info("🔍 执行检索: og 查询...")
         results_og = self._run_retrieval(q_og, candidates)

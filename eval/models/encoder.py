@@ -50,10 +50,12 @@ class SentenceTransformerEncoder(BaseEncoder):
         logger.info(f"📥 加载模型: {model_name}")
         self.model = SentenceTransformer(model_name, device=device)
         
+        self.model = self.model.half()
+        
         if max_seq_length:
             self.model.max_seq_length = max_seq_length
             
-        logger.info(f"✅ 模型加载完成: {model_name}")
+        logger.info(f"✅ 模型加载完成: {model_name} (float16)")
     
     def encode_queries(self, texts: List[str], batch_size: Optional[int] = None, **kwargs) -> torch.Tensor:
         """编码查询"""
@@ -122,6 +124,7 @@ class DenseRetriever:
     def __init__(self, encoder: BaseEncoder):
         self.encoder = encoder
         self.doc_embeddings: Dict[str, torch.Tensor] = {}
+        self.doc_ids: List[str] = []
     
     def index_documents(self, doc_ids: List[str], doc_texts: List[str], batch_size: int = 64) -> None:
         """构建文档索引"""
@@ -130,7 +133,14 @@ class DenseRetriever:
         embeddings = self.encoder.encode_documents(doc_texts, batch_size=batch_size)
         
         self.doc_embeddings = {doc_id: embeddings[idx] for idx, doc_id in enumerate(doc_ids)}
+        self.doc_ids = doc_ids
         logger.info(f"✅ 文档索引构建完成")
+    
+    def set_embeddings(self, embeddings: torch.Tensor, doc_ids: List[str]) -> None:
+        """直接设置已有文档向量"""
+        self.doc_embeddings = {doc_id: embeddings[idx] for idx, doc_id in enumerate(doc_ids)}
+        self.doc_ids = doc_ids
+        logger.info(f"✅ 文档向量已设置 (共 {len(doc_ids)} 个)")
     
     def search(
         self,

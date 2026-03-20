@@ -105,6 +105,38 @@ class DataLoader:
         logger.info(f"   ✅ 加载 {len(q_og)} 个 og 查询, {len(q_changed)} 个 changed 查询")
         return q_og, q_changed
     
+    def load_raw_queries(self):
+        """加载原始 query 和 instruction，用于 reformulator
+        
+        Returns:
+            (og_queries, changed_queries) 其中每个是 {qid: (query, instruction)} 的字典
+        """
+        ds_q = datasets.load_dataset(self.dataset_path, 'queries')
+        q_split = 'queries' if 'queries' in ds_q else 'train'
+        
+        ds_inst = datasets.load_dataset(self.dataset_path, 'instruction')
+        i_split = 'instruction' if 'instruction' in ds_inst else 'train'
+        
+        instruction_dict = {}
+        for item in ds_inst[i_split]:
+            qid = str(item.get('query-id', ''))
+            instruction_dict[qid] = str(item.get('instruction', ''))
+        
+        q_og_raw = {}
+        q_changed_raw = {}
+        
+        for q in ds_q[q_split]:
+            full_qid = str(q.get('_id', q.get('id', '')))
+            query_text = q.get('text', '')
+            inst = instruction_dict.get(full_qid, "")
+            
+            if full_qid.endswith('-og'):
+                q_og_raw[full_qid] = (query_text, inst)
+            elif full_qid.endswith('-changed'):
+                q_changed_raw[full_qid] = (query_text, inst)
+        
+        return q_og_raw, q_changed_raw
+    
     def load_candidates(self) -> Dict[str, List[str]]:
         """加载候选文档"""
         ds_top = datasets.load_dataset(self.dataset_path, 'top_ranked')
@@ -169,7 +201,8 @@ class FollowIREvaluator:
             "changed": {
                 "ndcg_at_5": scores.get('changed', {}).get('ndcg_at_5', 0),
                 "map_at_1000": scores.get('changed', {}).get('map_at_1000', 0),
-            }
+            },
+            "full_scores": scores
         }
         
         logger.info(f"   p-MRR: {metrics['p-MRR']:.4f}")
