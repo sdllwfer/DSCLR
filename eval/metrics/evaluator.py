@@ -195,11 +195,15 @@ class FollowIREvaluator:
         metrics = {
             "p-MRR": scores.get('p-MRR', 0),
             "original": {
+                "ndcg_at_1": scores.get('og', {}).get('ndcg_at_1', 0),
                 "ndcg_at_5": scores.get('og', {}).get('ndcg_at_5', 0),
+                "ndcg_at_10": scores.get('og', {}).get('ndcg_at_10', 0),
                 "map_at_1000": scores.get('og', {}).get('map_at_1000', 0),
             },
             "changed": {
+                "ndcg_at_1": scores.get('changed', {}).get('ndcg_at_1', 0),
                 "ndcg_at_5": scores.get('changed', {}).get('ndcg_at_5', 0),
+                "ndcg_at_10": scores.get('changed', {}).get('ndcg_at_10', 0),
                 "map_at_1000": scores.get('changed', {}).get('map_at_1000', 0),
             },
             "full_scores": scores

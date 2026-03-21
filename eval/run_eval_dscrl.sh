@@ -31,11 +31,13 @@ GPU_ID=0
 BATCH_SIZE=256
 SEED=42
 VERBOSE=false
+MLP_MODEL_PATH="train/output/3.21-dscrl_mlp_test_3/dsclr_best_mlp.pt"
 # TASK="Core17InstructionRetrieval"
-TASK="Robust04InstructionRetrieval"
+# TASK="Robust04InstructionRetrieval"
+TASK="News21InstructionRetrieval"
 # 输出路径 (指定 CUSTOM_OUTPUT_PATH 后直接使用，否则自动生成)
 OUTPUT_BASE_DIR="/home/luwa/Documents/DSCLR/evaluation/dsclr"
-CUSTOM_OUTPUT_PATH="/home/luwa/Documents/DSCLR/evaluation/dsclr/${TASK}_test"
+CUSTOM_OUTPUT_PATH="/home/luwa/Documents/DSCLR/evaluation/dsclr/mlp/${TASK}_test"
 
 # ============================================================
 # 显示帮助信息
@@ -53,6 +55,7 @@ DSCLR 双流检索评测系统启动脚本
     -g, --gpu <id>           GPU编号: 0/1/2/3 (默认: 0)
     -b, --batch_size <size>  批处理大小 (默认: 256)
     -s, --seed <num>         随机种子 (默认: 42)
+    -M, --mlp <path>         MLP模型路径 (可选，使用动态MLP推理)
     -v, --verbose            显示详细日志
     -h, --help               显示帮助信息
 
@@ -68,8 +71,8 @@ DSCLR 双流检索评测系统启动脚本
     # 使用第2张GPU评测
     $0 --task Core17InstructionRetrieval --gpu 1
 
-    # 指定输出目录
-    $0 -t Core17InstructionRetrieval -O /tmp/dsclr_eval
+    # 使用动态MLP推理
+    $0 --task Core17InstructionRetrieval --mlp train/output/3.21-dscrl_mlp_test_3/dsclr_best_mlp.pt
 
 EOF
 }
@@ -101,6 +104,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -s|--seed)
             SEED="$2"
+            shift 2
+            ;;
+        -M|--mlp)
+            MLP_MODEL_PATH="$2"
             shift 2
             ;;
         -v|--verbose)
@@ -170,7 +177,8 @@ python eval/engine_dscrl.py \
     --output_dir "$OUTPUT_DIR" \
     --device "cuda" \
     --batch_size "$BATCH_SIZE" \
-    --use_cache True
+    --use_cache True \
+    --mlp_model_path "$MLP_MODEL_PATH"
 
 EXIT_CODE=$?
 

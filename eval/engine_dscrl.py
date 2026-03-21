@@ -152,7 +152,7 @@ class DSCLRDenseRetriever:
         tau: float
     ) -> torch.Tensor:
         """
-        计算 DSCLR 最终得分
+        计算 DSCLR 最终得分（静态版本）
         S_final = S_base - alpha * ReLU(S_neg - tau)
         """
         # ReLU 惩罚项
@@ -240,18 +240,72 @@ class DSCLREvaluatorEngine:
         from eval.engine import FollowIRDataLoader
         self.data_loader = FollowIRDataLoader(self.task_name)
 
+        # 初始化 MLP (用于动态推理)
+        self.mlp = None
+        self.use_mlp = False
+
         logger.info(f"✅ DSCLR 评测引擎初始化完成")
         logger.info(f"   模型: {self.model_name}")
         logger.info(f"   任务: {self.task_name}")
         logger.info(f"   查询重构: LLM API (实时解耦)")
 
-    def run(self) -> Dict[str, Any]:
-        """运行 DSCLR 评测流程（含网格搜索）"""
+    def compute_dscrl_scores_dynamic(
+        self,
+        S_base: torch.Tensor,
+        S_neg: torch.Tensor,
+        q_minus_embeddings: torch.Tensor,
+        neg_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """计算 DSCLR 最终得分（动态 MLP 版本）
+        
+        使用绝对值扣分，并通过 neg_mask 保护 [NONE] 查询
+        """
+        if self.mlp is None:
+            raise RuntimeError("MLP model not loaded!")
+        
+        # 转换为 float32 以匹配 MLP 权重
+        q_minus_fp32 = q_minus_embeddings.float()
+        
+        alpha, tau = self.mlp(q_minus_fp32)
+        
+        # 扩展维度用于计算
+        alpha_expanded = alpha.unsqueeze(1)
+        tau_expanded = tau.unsqueeze(1)
+        neg_mask_expanded = neg_mask.unsqueeze(1)
+        
+        # 计算惩罚项
+        penalty = torch.relu(S_neg - tau_expanded)
+        
+        # 应用绝对值扣分，使用 neg_mask 保护 [NONE] 查询
+        # 如果 neg_mask=0（即 [NONE]），则惩罚为 0，S_final = S_base
+        S_final = S_base - alpha_expanded * penalty * neg_mask_expanded
+
+        return S_final, alpha, tau
+
+    def run(self, mlp_model_path: Optional[str] = None) -> Dict[str, Any]:
+        """运行 DSCLR 评测流程（含网格搜索或动态 MLP）
+        
+        Args:
+            mlp_model_path: 如果提供，则使用动态 MLP 推理；否则使用网格搜索
+        """
         logger.info("=" * 60)
-        logger.info("🚀 开始 DSCLR 评测 + 网格搜索")
+        logger.info("🚀 开始 DSCLR 评测")
         logger.info("=" * 60)
 
         start_time = time.time()
+
+        # 初始化 MLP (如果提供了模型路径)
+        if mlp_model_path:
+            logger.info(f"🧠 加载动态 MLP 模型: {mlp_model_path}")
+            from model.dsclr_mlp import DSCLR_MLP
+            self.mlp = DSCLR_MLP(input_dim=1024, hidden_dim=256).to(self.device)
+            self.mlp.load_state_dict(torch.load(mlp_model_path, map_location=self.device))
+            self.mlp.eval()
+            self.use_mlp = True
+            logger.info(f"✅ MLP 模型加载成功，进入动态推理模式")
+        else:
+            self.use_mlp = False
+            logger.info("🔬 使用静态网格搜索模式")
 
         # 加载数据
         corpus, q_og, q_changed, candidates = self.data_loader.load()
@@ -321,77 +375,121 @@ class DSCLREvaluatorEngine:
             q_plus_embeddings_changed, q_minus_embeddings_changed, neg_mask_changed
         )
 
-        # 随机搜索
-        logger.info(f"🔬 随机搜索: {len(self.param_combinations)} 组参数")
-        best_metrics = None
-        best_params = None
-        best_results_og = None
-        best_results_changed = None
-        all_results = []
-        all_query_metrics = []
+        # 动态推理 或 静态网格搜索
+        if self.use_mlp:
+            logger.info("🧠 使用动态 MLP 进行推理...")
+            with torch.no_grad():
+                # OG 查询
+                S_final_og, pred_alpha_og, pred_tau_og = self.compute_dscrl_scores_dynamic(
+                    S_base_og, S_neg_og, q_minus_embeddings_og, neg_mask_og
+                )
+                # Changed 查询
+                S_final_changed, pred_alpha_changed, pred_tau_changed = self.compute_dscrl_scores_dynamic(
+                    S_base_changed, S_neg_changed, q_minus_embeddings_changed, neg_mask_changed
+                )
+            
+            logger.info(f"   动态预测: avg_alpha_og={pred_alpha_og.mean().item():.4f}, avg_tau_og={pred_tau_og.mean().item():.4f}")
+            logger.info(f"   动态预测: avg_alpha_changed={pred_alpha_changed.mean().item():.4f}, avg_tau_changed={pred_tau_changed.mean().item():.4f}")
+            
+            # 提取检索结果
+            results_og = self._extract_results(S_final_og, query_ids_og, candidates)
+            results_changed = self._extract_results(S_final_changed, query_ids_changed, candidates)
+            
+            # 评测
+            from eval.metrics import FollowIREvaluator
+            evaluator = FollowIREvaluator(self.task_name)
+            best_metrics = evaluator.evaluate(results_og, results_changed)
+            best_params = {'alpha': 'dynamic', 'tau': 'dynamic'}
+            
+            # 计算单查询指标
+            all_query_metrics = self._compute_per_query_metrics(
+                results_og, results_changed, 
+                query_ids_og, query_ids_changed, candidates
+            )
+            
+            all_results = [{
+                'mode': 'dynamic_mlp',
+                'p-MRR': best_metrics.get('p-MRR', 0),
+                'og_nDCG@5': best_metrics.get('original', {}).get('ndcg_at_5', 0),
+                'changed_nDCG@5': best_metrics.get('changed', {}).get('ndcg_at_5', 0),
+                'metrics': best_metrics
+            }]
+        else:
+            # 静态网格搜索
+            logger.info(f"🔬 随机搜索: {len(self.param_combinations)} 组参数")
+            best_metrics = None
+            best_params = None
+            best_results_og = None
+            best_results_changed = None
+            all_results = []
+            all_query_metrics = []
 
-        for alpha, tau in self.param_combinations:
-                # 计算 og 最终得分
-                S_final_og = self.retriever.compute_dscrl_scores(S_base_og, S_neg_og, alpha, tau)
-                # 计算 changed 最终得分
-                S_final_changed = self.retriever.compute_dscrl_scores(S_base_changed, S_neg_changed, alpha, tau)
+            for alpha, tau in self.param_combinations:
+                    # 计算 og 最终得分
+                    S_final_og = self.retriever.compute_dscrl_scores(S_base_og, S_neg_og, alpha, tau)
+                    # 计算 changed 最终得分
+                    S_final_changed = self.retriever.compute_dscrl_scores(S_base_changed, S_neg_changed, alpha, tau)
 
-                # 提取检索结果
-                results_og = self._extract_results(S_final_og, query_ids_og, candidates)
-                results_changed = self._extract_results(S_final_changed, query_ids_changed, candidates)
+                    # 提取检索结果
+                    results_og = self._extract_results(S_final_og, query_ids_og, candidates)
+                    results_changed = self._extract_results(S_final_changed, query_ids_changed, candidates)
 
-                # 评测 - 使用正确的 og 和 changed 结果
-                from eval.metrics import FollowIREvaluator
-                evaluator = FollowIREvaluator(self.task_name)
-                metrics = evaluator.evaluate(results_og, results_changed)
+                    # 评测 - 使用正确的 og 和 changed 结果
+                    from eval.metrics import FollowIREvaluator
+                    evaluator = FollowIREvaluator(self.task_name)
+                    metrics = evaluator.evaluate(results_og, results_changed)
 
-                p_mrr = metrics.get('p-MRR', 0)
-                og_ndcg = metrics.get('original', {}).get('ndcg_at_5', 0)
-                changed_ndcg = metrics.get('changed', {}).get('ndcg_at_5', 0)
-                logger.info(f"   α={alpha:.1f}, τ={tau:.2f} => p-MRR={p_mrr:.4f}, og_nDCG@5={og_ndcg:.4f}, changed_nDCG@5={changed_ndcg:.4f}")
+                    p_mrr = metrics.get('p-MRR', 0)
+                    og_ndcg = metrics.get('original', {}).get('ndcg_at_5', 0)
+                    changed_ndcg = metrics.get('changed', {}).get('ndcg_at_5', 0)
+                    logger.info(f"   α={alpha:.1f}, τ={tau:.2f} => p-MRR={p_mrr:.4f}, og_nDCG@5={og_ndcg:.4f}, changed_nDCG@5={changed_ndcg:.4f}")
 
-                all_results.append({
-                    'alpha': alpha,
-                    'tau': tau,
-                    'p-MRR': p_mrr,
-                    'og_nDCG@5': og_ndcg,
-                    'changed_nDCG@5': changed_ndcg,
-                    'metrics': metrics
-                })
+                    all_results.append({
+                        'alpha': alpha,
+                        'tau': tau,
+                        'p-MRR': p_mrr,
+                        'og_nDCG@5': og_ndcg,
+                        'changed_nDCG@5': changed_ndcg,
+                        'metrics': metrics
+                    })
 
-                # 选择最佳参数：综合考虑 p-MRR、og_nDCG 和 changed_nDCG
-                # 标准化后求和作为综合得分
-                if best_metrics is None:
-                    best_metrics = metrics
-                    best_params = (alpha, tau)
-                    best_composite_score = p_mrr + og_ndcg + changed_ndcg
-                    best_results_og = results_og
-                    best_results_changed = results_changed
-                else:
-                    current_composite_score = p_mrr + og_ndcg + changed_ndcg
-                    best_composite_score = best_metrics.get('p-MRR', 0) + best_metrics.get('original', {}).get('ndcg_at_5', 0) + best_metrics.get('changed', {}).get('ndcg_at_5', 0)
-                    if current_composite_score > best_composite_score:
+                    # 选择最佳参数：综合考虑 p-MRR、og_nDCG 和 changed_nDCG
+                    if best_metrics is None:
                         best_metrics = metrics
                         best_params = (alpha, tau)
-                        best_composite_score = current_composite_score
+                        best_composite_score = p_mrr + og_ndcg + changed_ndcg
                         best_results_og = results_og
                         best_results_changed = results_changed
+                    else:
+                        current_composite_score = p_mrr + og_ndcg + changed_ndcg
+                        best_composite_score = best_metrics.get('p-MRR', 0) + best_metrics.get('original', {}).get('ndcg_at_5', 0) + best_metrics.get('changed', {}).get('ndcg_at_5', 0)
+                        if current_composite_score > best_composite_score:
+                            best_metrics = metrics
+                            best_params = (alpha, tau)
+                            best_composite_score = current_composite_score
+                            best_results_og = results_og
+                            best_results_changed = results_changed
+            
+            # 为每个查询计算详细的性能指标
+            all_query_metrics = self._compute_per_query_metrics(
+                best_results_og, best_results_changed, 
+                query_ids_og, query_ids_changed, candidates
+            )
 
         elapsed_time = time.time() - start_time
 
-        # 为每个查询计算详细的性能指标
-        all_query_metrics = self._compute_per_query_metrics(
-            best_results_og, best_results_changed, 
-            query_ids_og, query_ids_changed, candidates
-        )
-
         # 输出结果
         logger.info("=" * 60)
-        logger.info("📊 DSCLR 随机搜索结果:")
-        logger.info(f"   最佳参数: α={best_params[0]}, τ={best_params[1]}")
-        logger.info(f"   最佳 p-MRR: {best_metrics.get('p-MRR', 0):.4f}")
-        logger.info(f"   og nDCG@5: {best_metrics.get('original', {}).get('ndcg_at_5', 0):.4f}")
-        logger.info(f"   changed nDCG@5: {best_metrics.get('changed', {}).get('ndcg_at_5', 0):.4f}")
+        if self.use_mlp:
+            logger.info("🧠 DSCLR 动态 MLP 推理结果:")
+        else:
+            logger.info("📊 DSCLR 随机搜索结果:")
+            logger.info(f"   最佳参数: α={best_params[0]}, τ={best_params[1]}")
+        og_metrics = best_metrics.get('original', {})
+        changed_metrics = best_metrics.get('changed', {})
+        logger.info(f"   p-MRR: {best_metrics.get('p-MRR', 0):.4f}")
+        logger.info(f"   OG - nDCG@1: {og_metrics.get('ndcg_at_1', 0):.4f}, nDCG@5: {og_metrics.get('ndcg_at_5', 0):.4f}, nDCG@10: {og_metrics.get('ndcg_at_10', 0):.4f}")
+        logger.info(f"   Changed - nDCG@1: {changed_metrics.get('ndcg_at_1', 0):.4f}, nDCG@5: {changed_metrics.get('ndcg_at_5', 0):.4f}, nDCG@10: {changed_metrics.get('ndcg_at_10', 0):.4f}")
         logger.info(f"   耗时: {elapsed_time:.1f}秒")
         logger.info("=" * 60)
 
@@ -408,42 +506,31 @@ class DSCLREvaluatorEngine:
         run_og_path = os.path.join(trec_dir, f"run_{self.task_name}_og.trec")
         run_changed_path = os.path.join(trec_dir, f"run_{self.task_name}_changed.trec")
         
-        self._save_trec_format(best_results_og, run_og_path)
-        self._save_trec_format(best_results_changed, run_changed_path)
+        # 保存 TREC 格式文件
+        self._save_trec_format(results_og, run_og_path)
+        self._save_trec_format(results_changed, run_changed_path)
         
         logger.info(f"💾 TREC 文件已保存:")
         logger.info(f"   OG: {run_og_path}")
         logger.info(f"   Changed: {run_changed_path}")
 
         # 保存结果
-        self._save_results(all_results, best_params, best_metrics)
-
-        # 保存最佳参数的单独文件
-        best_result_path = os.path.join(self.output_dir, "best_params_result.json")
-        best_result = {
-            'best_params': {'alpha': best_params[0], 'tau': best_params[1]},
-            'best_composite_score': float(best_composite_score),
-            'metrics': best_metrics,
-            'all_results_summary': [
-                {
-                    'alpha': r['alpha'],
-                    'tau': r['tau'],
-                    'p-MRR': r['p-MRR'],
-                    'og_nDCG@5': r['og_nDCG@5'],
-                    'changed_nDCG@5': r['changed_nDCG@5'],
-                    'composite_score': r['p-MRR'] + r['og_nDCG@5'] + r['changed_nDCG@5']
-                }
-                for r in all_results
-            ]
-        }
-        with open(best_result_path, 'w', encoding='utf-8') as f:
-            json.dump(best_result, f, indent=2, ensure_ascii=False)
-        logger.info(f"💾 最佳参数结果已保存: {best_result_path}")
+        if self.use_mlp:
+            # MLP 模式：只保存测试指标结果
+            result_path = os.path.join(self.output_dir, "mlp_results.json")
+            with open(result_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'mode': 'dynamic_mlp',
+                    'metrics': best_metrics
+                }, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 MLP 测试结果已保存: {result_path}")
+        else:
+            # 静态网格搜索模式：保存完整结果
+            self._save_results(all_results, best_params, best_metrics)
 
         return {
-            'best_params': {'alpha': best_params[0], 'tau': best_params[1]},
-            'best_metrics': best_metrics,
-            'all_results': all_results
+            'best_params': {'alpha': 'dynamic', 'tau': 'dynamic'} if self.use_mlp else {'alpha': best_params[0], 'tau': best_params[1]},
+            'best_metrics': best_metrics
         }
 
     def _get_all_candidate_doc_ids(self, candidates: Dict[str, List[str]]) -> List[str]:
@@ -452,6 +539,19 @@ class DSCLREvaluatorEngine:
         for doc_ids in candidates.values():
             all_doc_ids_set.update(doc_ids)
         return list(all_doc_ids_set)
+
+    def _get_bulletproof_mask(self, q_minus_text: str) -> float:
+        """防弹级掩码生成函数
+        
+        拦截所有可能的 LLM 废话输出，确保 [NONE] 查询不受惩罚
+        """
+        if not q_minus_text:
+            return 0.0
+        text = str(q_minus_text).strip().upper()
+        # 拦截所有可能的无效输出
+        if text in ["[NONE]", "NONE", "NULL", "N/A", "", "[NONE]", "NONE"]:
+            return 0.0
+        return 1.0
 
     def _prepare_dual_queries(
         self,
@@ -493,9 +593,9 @@ class DSCLREvaluatorEngine:
             q_plus_list.append(q_plus)
             q_minus_list.append(q_minus)
 
-        # 生成 mask: [NONE] 位置为 0.0，否则为 1.0
+        # 使用防弹级掩码生成函数
         neg_mask = torch.tensor(
-            [0.0 if qm == "[NONE]" else 1.0 for qm in q_minus_list],
+            [self._get_bulletproof_mask(qm) for qm in q_minus_list],
             dtype=torch.float32,
             device=self.device
         )
@@ -552,19 +652,29 @@ class DSCLREvaluatorEngine:
     def _save_results(
         self,
         all_results: List[Dict],
-        best_params: Tuple[float, float],
+        best_params,
         best_metrics: Dict
     ) -> None:
         """保存评测结果"""
-        # 保存完整网格搜索结果
         results_path = os.path.join(self.output_dir, "random_search_results.json")
-        with open(results_path, 'w', encoding='utf-8') as f:
-            json.dump({
+        
+        if self.use_mlp:
+            save_data = {
+                'best_params': best_params,
+                'mode': 'dynamic_mlp',
+                'best_metrics': best_metrics,
+                'all_results': all_results
+            }
+        else:
+            save_data = {
                 'best_params': {'alpha': best_params[0], 'tau': best_params[1]},
                 'best_metrics': best_metrics,
                 'all_results': all_results
-            }, f, indent=2, ensure_ascii=False)
-        logger.info(f"💾 随机搜索结果已保存: {results_path}")
+            }
+        
+        with open(results_path, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"💾 结果已保存: {results_path}")
 
     def _save_trec_format(
         self,
@@ -886,7 +996,8 @@ def run_dsclr_evaluation(
     device: str = "cuda",
     batch_size: int = 64,
     cache_dir: Optional[str] = None,
-    use_cache: bool = True
+    use_cache: bool = True,
+    mlp_model_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """运行 DSCLR 评测的便捷函数"""
     engine = DSCLREvaluatorEngine(
@@ -898,7 +1009,7 @@ def run_dsclr_evaluation(
         cache_dir=cache_dir,
         use_cache=use_cache
     )
-    return engine.run()
+    return engine.run(mlp_model_path=mlp_model_path)
 
 
 if __name__ == "__main__":
@@ -912,6 +1023,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64, help="批次大小")
     parser.add_argument("--cache_dir", type=str, default=None, help="缓存目录")
     parser.add_argument("--use_cache", type=bool, default=True, help="是否使用缓存")
+    parser.add_argument("--mlp_model_path", type=str, default=None, help="MLP模型路径 (可选，使用动态MLP推理)")
     
     args = parser.parse_args()
     
@@ -927,7 +1039,7 @@ if __name__ == "__main__":
         device=args.device,
         batch_size=args.batch_size,
         cache_dir=args.cache_dir,
-        use_cache=args.use_cache
+        use_cache=args.use_cache,
+        mlp_model_path=args.mlp_model_path
     )
-    print(f"\n最佳参数: {results['best_params']}")
-    print(f"最佳 p-MRR: {results['best_metrics'].get('p-MRR', 0):.4f}")
+    print(f"\n最终 p-MRR: {results['best_metrics'].get('p-MRR', 0):.4f}")
