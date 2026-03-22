@@ -4,6 +4,7 @@
 """
 
 import os
+import time
 import logging
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any
@@ -100,10 +101,24 @@ class ModelFactory:
     
     @classmethod
     def create(cls, model_name: str, **kwargs) -> BaseEncoder:
-        """创建模型实例"""
+        """创建模型实例
+        
+        自动识别模型类型：
+        - e5-mistral: 使用 E5MistralEncoder
+        - 其他: 使用 SentenceTransformerEncoder
+        """
+        # 检查是否已注册
         if model_name in cls._models:
             return cls._models[model_name](**kwargs)
         
+        # 自动识别 E5-Mistral 模型
+        if "e5-mistral" in model_name.lower():
+            # 延迟导入避免循环依赖
+            from .e5_mistral_encoder import E5MistralEncoder
+            logger.info(f"🔍 自动识别为 E5-Mistral 模型: {model_name}")
+            return E5MistralEncoder(model_name=model_name, **kwargs)
+        
+        # 默认使用 SentenceTransformer
         return SentenceTransformerEncoder(
             model_name=model_name,
             **kwargs
@@ -126,15 +141,103 @@ class DenseRetriever:
         self.doc_embeddings: Dict[str, torch.Tensor] = {}
         self.doc_ids: List[str] = []
     
-    def index_documents(self, doc_ids: List[str], doc_texts: List[str], batch_size: int = 64) -> None:
-        """构建文档索引"""
+    def index_documents(self, doc_ids: List[str], doc_texts: List[str], batch_size: int = 64, 
+                        checkpoint_dir: Optional[str] = None, checkpoint_interval: int = 1000) -> None:
+        """构建文档索引（支持分块保存）
+        
+        Args:
+            doc_ids: 文档ID列表
+            doc_texts: 文档文本列表
+            batch_size: 批处理大小
+            checkpoint_dir: 检查点保存目录，如果提供则定期保存
+            checkpoint_interval: 每处理多少文档保存一次检查点
+        """
         logger.info(f"📚 索引 {len(doc_ids)} 个文档...")
         
-        embeddings = self.encoder.encode_documents(doc_texts, batch_size=batch_size)
+        # 如果提供了检查点目录，尝试加载已有的检查点
+        start_idx = 0
+        if checkpoint_dir is not None:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            start_idx = self._load_checkpoint(checkpoint_dir, doc_ids)
+            if start_idx > 0:
+                logger.info(f"🔄 从检查点恢复，已处理 {start_idx}/{len(doc_ids)} 个文档")
         
-        self.doc_embeddings = {doc_id: embeddings[idx] for idx, doc_id in enumerate(doc_ids)}
-        self.doc_ids = doc_ids
+        # 增量编码
+        if start_idx < len(doc_ids):
+            for i in range(start_idx, len(doc_ids), batch_size):
+                end_idx = min(i + batch_size, len(doc_ids))
+                batch_ids = doc_ids[i:end_idx]
+                batch_texts = doc_texts[i:end_idx]
+                
+                # 编码当前批次
+                batch_embeddings = self.encoder.encode_documents(batch_texts, batch_size=batch_size)
+                
+                # 存储到内存
+                for idx, doc_id in enumerate(batch_ids):
+                    self.doc_embeddings[doc_id] = batch_embeddings[idx]
+                self.doc_ids.extend(batch_ids)
+                
+                # 定期保存检查点
+                if checkpoint_dir is not None and end_idx % checkpoint_interval == 0:
+                    self._save_checkpoint(checkpoint_dir, doc_ids, end_idx)
+                    logger.info(f"💾 检查点已保存: {end_idx}/{len(doc_ids)} 个文档")
+                
+                # 进度日志
+                if (end_idx - start_idx) % (batch_size * 10) == 0 or end_idx == len(doc_ids):
+                    logger.info(f"  已编码 {end_idx}/{len(doc_ids)}")
+        
+        self.doc_ids = doc_ids  # 确保顺序一致
         logger.info(f"✅ 文档索引构建完成")
+        
+        # 最终保存检查点
+        if checkpoint_dir is not None:
+            self._save_checkpoint(checkpoint_dir, doc_ids, len(doc_ids))
+            logger.info(f"💾 最终检查点已保存")
+    
+    def _save_checkpoint(self, checkpoint_dir: str, doc_ids: List[str], processed_count: int) -> None:
+        """保存检查点"""
+        checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pt")
+        
+        # 只保存已处理的文档
+        processed_ids = doc_ids[:processed_count]
+        embeddings_list = [self.doc_embeddings[did] for did in processed_ids]
+        
+        checkpoint = {
+            'processed_count': processed_count,
+            'doc_ids': processed_ids,
+            'embeddings': torch.stack(embeddings_list) if embeddings_list else torch.empty(0),
+            'timestamp': time.time()
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+    
+    def _load_checkpoint(self, checkpoint_dir: str, doc_ids: List[str]) -> int:
+        """加载检查点，返回已处理的文档数量"""
+        checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pt")
+        
+        if not os.path.exists(checkpoint_path):
+            return 0
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            processed_ids = checkpoint['doc_ids']
+            embeddings = checkpoint['embeddings']
+            
+            # 验证检查点是否匹配当前文档集合
+            if set(processed_ids).issubset(set(doc_ids)):
+                # 恢复已处理的文档
+                for idx, doc_id in enumerate(processed_ids):
+                    self.doc_embeddings[doc_id] = embeddings[idx]
+                self.doc_ids = list(processed_ids)
+                
+                logger.info(f"✅ 检查点加载成功: {len(processed_ids)} 个文档")
+                return len(processed_ids)
+            else:
+                logger.warning("⚠️ 检查点文档ID不匹配，重新编码")
+                return 0
+        except Exception as e:
+            logger.warning(f"⚠️ 检查点加载失败: {e}，重新编码")
+            return 0
     
     def set_embeddings(self, embeddings: torch.Tensor, doc_ids: List[str]) -> None:
         """直接设置已有文档向量"""

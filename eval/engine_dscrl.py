@@ -30,22 +30,72 @@ logger = logging.getLogger(__name__)
 DEFAULT_CACHE_DIR = "/home/luwa/Documents/DSCLR/dataset/FollowIR_test/embeddings"
 
 
+def get_model_cache_dir(base_cache_dir: str, model_name: str) -> str:
+    """根据模型名称获取模型专属的缓存目录"""
+    if "mistral" in model_name.lower():
+        model_subdir = "e5-mistral-7b"
+    elif "bge" in model_name.lower():
+        model_subdir = "bge-large-en"
+    else:
+        model_subdir = model_name.split("/")[-1].replace("-", "_")
+    
+    return os.path.join(base_cache_dir, model_subdir)
+
+
+def get_model_name_short(model_name: str) -> str:
+    """从模型全名获取短名称用于缓存"""
+    if "mistral" in model_name.lower():
+        return "e5-mistral-7b"
+    elif "bge" in model_name.lower():
+        return "bge-large-en"
+    else:
+        # 默认使用模型名称的最后一部分
+        return model_name.split("/")[-1].replace("-", "_")
+
+
 def load_cached_embeddings(
     cache_dir: str,
-    task_name: str
+    task_name: str,
+    model_name: str
 ) -> Optional[Tuple[torch.Tensor, List[str]]]:
     """尝试加载缓存的文档向量"""
-    model_name_short = "bge-large-en"
-    cache_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
-    ids_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
+    # 使用模型专属的缓存目录
+    model_cache_dir = get_model_cache_dir(cache_dir, model_name)
+    model_name_short = get_model_name_short(model_name)
+    cache_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
+    ids_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
 
     if os.path.exists(cache_file) and os.path.exists(ids_file):
         logger.info(f"📂 加载缓存的文档向量: {cache_file}")
-        embeddings = np.load(cache_file)
-        with open(ids_file, 'r') as f:
-            doc_ids = json.load(f)
-        logger.info(f"✅ 缓存加载成功: {len(doc_ids)} 个文档, shape={embeddings.shape}")
-        return torch.tensor(embeddings), doc_ids
+        
+        # 尝试加载为 numpy 数组
+        try:
+            embeddings = np.load(cache_file)
+            with open(ids_file, 'r') as f:
+                doc_ids = json.load(f)
+            logger.info(f"✅ 缓存加载成功: {len(doc_ids)} 个文档, shape={embeddings.shape}")
+            return torch.tensor(embeddings), doc_ids
+        except:
+            # 可能是 dict 格式（E5-Mistral 保存的格式）
+            try:
+                data = np.load(cache_file, allow_pickle=True)
+                if data.dtype == np.object_ and len(data.shape) == 0:
+                    embedding_dict = data.item()
+                    with open(ids_file, 'r') as f:
+                        doc_ids = json.load(f)
+                    
+                    # 按 doc_ids 顺序提取 embeddings
+                    embeddings_list = []
+                    for doc_id in doc_ids:
+                        if doc_id in embedding_dict:
+                            embeddings_list.append(embedding_dict[doc_id])
+                    
+                    if embeddings_list:
+                        embeddings = torch.stack(embeddings_list)
+                        logger.info(f"✅ 缓存加载成功 (dict格式): {len(doc_ids)} 个文档, shape={embeddings.shape}")
+                        return embeddings, doc_ids
+            except Exception as e:
+                logger.warning(f"⚠️ 缓存加载失败: {e}")
 
     logger.info(f"⚠️ 未找到缓存: {cache_file}")
     return None
@@ -54,14 +104,17 @@ def load_cached_embeddings(
 def save_embeddings_cache(
     cache_dir: str,
     task_name: str,
+    model_name: str,
     embeddings: torch.Tensor,
     doc_ids: List[str]
 ) -> None:
     """保存文档向量到缓存"""
-    os.makedirs(cache_dir, exist_ok=True)
-    model_name_short = "bge-large-en"
-    cache_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
-    ids_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
+    # 使用模型专属的缓存目录
+    model_cache_dir = get_model_cache_dir(cache_dir, model_name)
+    os.makedirs(model_cache_dir, exist_ok=True)
+    model_name_short = get_model_name_short(model_name)
+    cache_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
+    ids_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
 
     np.save(cache_file, embeddings.cpu().numpy())
     with open(ids_file, 'w') as f:
@@ -111,27 +164,58 @@ class DSCLRDenseRetriever:
         doc_ids: List[str]
     ) -> None:
         """直接设置已编码的文档向量"""
+        logger.info(f"   [set_embeddings] 输入设备: {embeddings.device}, 目标设备: {self.device}")
+        
         # 确保 L2 归一化
         if embeddings.dim() == 2:
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         
         # 确保在正确的设备上
         embeddings = embeddings.to(self.device)
+        logger.info(f"   [set_embeddings] 转移后设备: {embeddings.device}")
         
         self.doc_embeddings = embeddings
         self.doc_ids = doc_ids
         logger.info(f"✅ 文档向量已加载 (L2 归一化)")
+
+    def compute_base_scores(
+        self,
+        q_plus_embeddings: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        计算基础得分矩阵（仅 S_base，用于 OG 查询）
+        返回: S_base
+        """
+        # 确保在同一设备上
+        device = self.doc_embeddings.device
+        if q_plus_embeddings.device != device:
+            q_plus_embeddings = q_plus_embeddings.to(device)
+        
+        # S_base: [num_queries, num_docs]
+        S_base = torch.matmul(q_plus_embeddings, self.doc_embeddings.T)
+        return S_base
 
     def compute_scores_matrix(
         self,
         q_plus_embeddings: torch.Tensor,
         q_minus_embeddings: torch.Tensor,
         neg_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        计算得分矩阵（向量化）
-        返回: (S_base, S_neg, S_final)
+        计算得分矩阵（向量化，用于 Changed 查询）
+        返回: (S_base, S_neg)
         """
+        # 调试设备信息
+        logger.info(f"   [compute_scores_matrix] q_plus: {q_plus_embeddings.device}, doc_emb: {self.doc_embeddings.device}")
+        
+        # 确保所有张量在同一设备上（使用 doc_embeddings 的设备作为目标）
+        device = self.doc_embeddings.device
+        if q_plus_embeddings.device != device:
+            logger.warning(f"   设备不匹配！将查询 embeddings 转移到 {device}")
+            q_plus_embeddings = q_plus_embeddings.to(device)
+            q_minus_embeddings = q_minus_embeddings.to(device)
+            neg_mask = neg_mask.to(device)
+        
         # 文档已在索引时归一化，查询也已归一化
         # S_base: [num_queries, num_docs]
         S_base = torch.matmul(q_plus_embeddings, self.doc_embeddings.T)
@@ -263,17 +347,25 @@ class DSCLREvaluatorEngine:
         if self.mlp is None:
             raise RuntimeError("MLP model not loaded!")
         
+        # 确保 q_minus_embeddings 在正确的设备上
+        device = next(self.mlp.parameters()).device
+        if q_minus_embeddings.device != device:
+            q_minus_embeddings = q_minus_embeddings.to(device)
+        
         # 转换为 float32 以匹配 MLP 权重
         q_minus_fp32 = q_minus_embeddings.float()
         
-        alpha, tau = self.mlp(q_minus_fp32)
+        # 根据模型名称确定 encoder_type
+        encoder_type = 'mistral' if 'mistral' in self.model_name.lower() else 'bge'
+        
+        alpha, tau = self.mlp(q_minus_fp32, encoder_type=encoder_type)
         
         # 扩展维度用于计算
         alpha_expanded = alpha.unsqueeze(1)
         tau_expanded = tau.unsqueeze(1)
         neg_mask_expanded = neg_mask.unsqueeze(1)
         
-        # 计算惩罚项
+        # 计算惩罚项（统一使用线性 ReLU）
         penalty = torch.relu(S_neg - tau_expanded)
         
         # 应用绝对值扣分，使用 neg_mask 保护 [NONE] 查询
@@ -282,11 +374,12 @@ class DSCLREvaluatorEngine:
 
         return S_final, alpha, tau
 
-    def run(self, mlp_model_path: Optional[str] = None) -> Dict[str, Any]:
+    def run(self, mlp_model_path: Optional[str] = None, mlp_hidden_dim: int = 256) -> Dict[str, Any]:
         """运行 DSCLR 评测流程（含网格搜索或动态 MLP）
         
         Args:
             mlp_model_path: 如果提供，则使用动态 MLP 推理；否则使用网格搜索
+            mlp_hidden_dim: MLP隐藏层维度 (默认: 256)
         """
         logger.info("=" * 60)
         logger.info("🚀 开始 DSCLR 评测")
@@ -298,11 +391,21 @@ class DSCLREvaluatorEngine:
         if mlp_model_path:
             logger.info(f"🧠 加载动态 MLP 模型: {mlp_model_path}")
             from model.dsclr_mlp import DSCLR_MLP
-            self.mlp = DSCLR_MLP(input_dim=1024, hidden_dim=256).to(self.device)
+            
+            # 根据模型名称确定嵌入维度
+            if "mistral" in self.model_name.lower():
+                embed_dim = 4096
+                logger.info(f"   检测到 Mistral 模型，使用嵌入维度: {embed_dim}")
+            else:
+                embed_dim = 1024
+                logger.info(f"   使用默认嵌入维度: {embed_dim}")
+            
+            # 使用指定的 hidden_dim
+            self.mlp = DSCLR_MLP(input_dim=embed_dim, hidden_dim=mlp_hidden_dim).to(self.device)
             self.mlp.load_state_dict(torch.load(mlp_model_path, map_location=self.device))
             self.mlp.eval()
             self.use_mlp = True
-            logger.info(f"✅ MLP 模型加载成功，进入动态推理模式")
+            logger.info(f"✅ MLP 模型加载成功 (hidden_dim={mlp_hidden_dim})，进入动态推理模式")
         else:
             self.use_mlp = False
             logger.info("🔬 使用静态网格搜索模式")
@@ -319,7 +422,7 @@ class DSCLREvaluatorEngine:
         # 尝试加载缓存
         cached_data = None
         if self.use_cache:
-            cached_data = load_cached_embeddings(self.cache_dir, self.task_name)
+            cached_data = load_cached_embeddings(self.cache_dir, self.task_name, self.model_name)
         
         if cached_data is not None:
             cached_embeddings, cached_doc_ids = cached_data
@@ -337,39 +440,36 @@ class DSCLREvaluatorEngine:
                 logger.warning(f"⚠️ 缓存文档ID不匹配，重新编码...")
                 doc_texts = [corpus[did]['text'] for did in all_doc_ids]
                 self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
-                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
+                save_embeddings_cache(self.cache_dir, self.task_name, self.model_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
         else:
             # 无缓存，重新编码并保存
             logger.info("📚 编码候选文档...")
             doc_texts = [corpus[did]['text'] for did in all_doc_ids]
             self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
             if self.use_cache:
-                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
+                save_embeddings_cache(self.cache_dir, self.task_name, self.model_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
 
-        # 构建 og 查询对 (使用 reformulator 实时解耦)
-        logger.info("🔍 准备 og 查询 (LLM API 解耦)...")
-        q_plus_list_og, q_minus_list_og, neg_mask_og, query_ids_og = self._prepare_dual_queries(q_og, q_raw_og)
+        # 构建 og 查询对 (仅提取 Q+，节省算力)
+        logger.info("🔍 准备 og 查询 (仅 Q+)...")
+        q_plus_list_og, query_ids_og = self._prepare_single_queries(q_og, q_raw_og)
         
-        # 构建 changed 查询对 (使用 reformulator 实时解耦)
-        logger.info("🔍 准备 changed 查询 (LLM API 解耦)...")
+        # 构建 changed 查询对 (使用 reformulator 实时解耦，需要 Q+ 和 Q-)
+        logger.info("🔍 准备 changed 查询 (Q+ 和 Q-)...")
         q_plus_list_changed, q_minus_list_changed, neg_mask_changed, query_ids_changed = self._prepare_dual_queries(q_changed, q_raw_changed)
 
         # 编码查询
-        logger.info("🔍 编码 Q+ 和 Q- (og)...")
+        logger.info("🔍 编码 OG 查询 (仅 Q+)...")
         q_plus_embeddings_og = self._encode_queries(q_plus_list_og)
-        q_minus_embeddings_og = self._encode_queries(q_minus_list_og)
         
-        logger.info("🔍 编码 Q+ 和 Q- (changed)...")
+        logger.info("🔍 编码 Changed 查询 (Q+ 和 Q-)...")
         q_plus_embeddings_changed = self._encode_queries(q_plus_list_changed)
         q_minus_embeddings_changed = self._encode_queries(q_minus_list_changed)
 
-        # 计算 og 得分矩阵
-        logger.info("📊 计算 og 得分矩阵...")
-        S_base_og, S_neg_og = self.retriever.compute_scores_matrix(
-            q_plus_embeddings_og, q_minus_embeddings_og, neg_mask_og
-        )
+        # 计算 og 得分矩阵 (仅 S_base，无 S_neg)
+        logger.info("📊 计算 og 得分矩阵 (仅 S_base)...")
+        S_base_og = self.retriever.compute_base_scores(q_plus_embeddings_og)
         
-        # 计算 changed 得分矩阵
+        # 计算 changed 得分矩阵 (S_base 和 S_neg)
         logger.info("📊 计算 changed 得分矩阵...")
         S_base_changed, S_neg_changed = self.retriever.compute_scores_matrix(
             q_plus_embeddings_changed, q_minus_embeddings_changed, neg_mask_changed
@@ -379,17 +479,18 @@ class DSCLREvaluatorEngine:
         if self.use_mlp:
             logger.info("🧠 使用动态 MLP 进行推理...")
             with torch.no_grad():
-                # OG 查询
-                S_final_og, pred_alpha_og, pred_tau_og = self.compute_dscrl_scores_dynamic(
-                    S_base_og, S_neg_og, q_minus_embeddings_og, neg_mask_og
-                )
-                # Changed 查询
+                # 【物理隔离】OG 查询直接使用 S_base，不经过任何 MLP 惩罚！
+                S_final_og = S_base_og
+                pred_alpha_og = torch.zeros(len(query_ids_og), device=self.device)
+                pred_tau_og = torch.zeros(len(query_ids_og), device=self.device)
+                
+                # 只有 Changed 查询才进入动态门控计算
                 S_final_changed, pred_alpha_changed, pred_tau_changed = self.compute_dscrl_scores_dynamic(
                     S_base_changed, S_neg_changed, q_minus_embeddings_changed, neg_mask_changed
                 )
             
-            logger.info(f"   动态预测: avg_alpha_og={pred_alpha_og.mean().item():.4f}, avg_tau_og={pred_tau_og.mean().item():.4f}")
-            logger.info(f"   动态预测: avg_alpha_changed={pred_alpha_changed.mean().item():.4f}, avg_tau_changed={pred_tau_changed.mean().item():.4f}")
+            logger.info(f"   OG 查询: 物理隔离，直接使用 S_base (无惩罚)")
+            logger.info(f"   Changed 查询: 动态预测 avg_alpha={pred_alpha_changed.mean().item():.4f}, avg_tau={pred_tau_changed.mean().item():.4f}")
             
             # 提取检索结果
             results_og = self._extract_results(S_final_og, query_ids_og, candidates)
@@ -425,9 +526,9 @@ class DSCLREvaluatorEngine:
             all_query_metrics = []
 
             for alpha, tau in self.param_combinations:
-                    # 计算 og 最终得分
-                    S_final_og = self.retriever.compute_dscrl_scores(S_base_og, S_neg_og, alpha, tau)
-                    # 计算 changed 最终得分
+                    # 【物理隔离】OG 查询直接使用 S_base，不经过任何惩罚！
+                    S_final_og = S_base_og
+                    # 只有 Changed 查询才应用 DSCLR 惩罚
                     S_final_changed = self.retriever.compute_dscrl_scores(S_base_changed, S_neg_changed, alpha, tau)
 
                     # 提取检索结果
@@ -553,6 +654,32 @@ class DSCLREvaluatorEngine:
             return 0.0
         return 1.0
 
+    def _prepare_single_queries(
+        self,
+        queries: Dict[str, str],
+        raw_queries: Dict[str, Tuple[str, str]]
+    ) -> Tuple[List[str], List[str]]:
+        """
+        准备单流查询（仅 Q+）- 用于 OG 查询，节省算力
+        返回: (q_plus_list, query_ids)
+        """
+        query_ids = []
+        q_plus_list = []
+
+        for qid in queries.keys():
+            # 获取原始 query 和 instruction
+            raw = raw_queries.get(qid, ("", ""))
+            query_text, instruction = raw[0], raw[1]
+            
+            # OG 查询使用 query + instruction 拼接（与基线评估一致）
+            q_plus = f"{query_text} {instruction}".strip() if query_text else queries.get(qid, "")
+
+            query_ids.append(qid)
+            q_plus_list.append(q_plus)
+
+        logger.info(f"   单流查询准备完成: {len(query_ids)} 个")
+        return q_plus_list, query_ids
+
     def _prepare_dual_queries(
         self,
         queries: Dict[str, str],
@@ -593,12 +720,25 @@ class DSCLREvaluatorEngine:
             q_plus_list.append(q_plus)
             q_minus_list.append(q_minus)
 
-        # 使用防弹级掩码生成函数
+        # 【调试逻辑】强制 OG 查询跳过 MLP，即使 Q- 不为 None
+        # 这样可以让 OG nDCG 与原始检索模型对比，验证掩码逻辑
+        def get_debug_mask(qm, qid):
+            base_mask = self._get_bulletproof_mask(qm)
+            if qid.endswith("-og"):
+                # 强制 OG 查询 mask = 0，跳过 MLP
+                return 0.0
+            return base_mask
+        
         neg_mask = torch.tensor(
-            [self._get_bulletproof_mask(qm) for qm in q_minus_list],
+            [get_debug_mask(qm, qid) for qm, qid in zip(q_minus_list, query_ids)],
             dtype=torch.float32,
             device=self.device
         )
+        
+        # 统计调试信息
+        og_count = sum(1 for qid in query_ids if qid.endswith("-og"))
+        changed_count = len(query_ids) - og_count
+        logger.info(f"【调试模式】OG 查询强制跳过 MLP: {og_count} 个, Changed 查询: {changed_count} 个")
 
         return q_plus_list, q_minus_list, neg_mask, query_ids
 
@@ -633,8 +773,8 @@ class DSCLREvaluatorEngine:
 
             doc_ids = candidates[base_qid]
 
-            # 获取该查询对应的得分
-            scores = S_final[idx].cpu().numpy()
+            # 获取该查询对应的得分 (转换为 float32，避免 BFloat16 问题)
+            scores = S_final[idx].cpu().float().numpy()
 
             # 使用 doc_id_to_col_idx 找到正确的列索引
             doc_scores = {}
@@ -997,7 +1137,8 @@ def run_dsclr_evaluation(
     batch_size: int = 64,
     cache_dir: Optional[str] = None,
     use_cache: bool = True,
-    mlp_model_path: Optional[str] = None
+    mlp_model_path: Optional[str] = None,
+    mlp_hidden_dim: int = 256
 ) -> Dict[str, Any]:
     """运行 DSCLR 评测的便捷函数"""
     engine = DSCLREvaluatorEngine(
@@ -1009,7 +1150,7 @@ def run_dsclr_evaluation(
         cache_dir=cache_dir,
         use_cache=use_cache
     )
-    return engine.run(mlp_model_path=mlp_model_path)
+    return engine.run(mlp_model_path=mlp_model_path, mlp_hidden_dim=mlp_hidden_dim)
 
 
 if __name__ == "__main__":
@@ -1024,6 +1165,7 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str, default=None, help="缓存目录")
     parser.add_argument("--use_cache", type=bool, default=True, help="是否使用缓存")
     parser.add_argument("--mlp_model_path", type=str, default=None, help="MLP模型路径 (可选，使用动态MLP推理)")
+    parser.add_argument("--mlp_hidden_dim", type=int, default=256, help="MLP隐藏层维度 (默认: 256)")
     
     args = parser.parse_args()
     
@@ -1040,6 +1182,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         cache_dir=args.cache_dir,
         use_cache=args.use_cache,
-        mlp_model_path=args.mlp_model_path
+        mlp_model_path=args.mlp_model_path,
+        mlp_hidden_dim=args.mlp_hidden_dim
     )
     print(f"\n最终 p-MRR: {results['best_metrics'].get('p-MRR', 0):.4f}")

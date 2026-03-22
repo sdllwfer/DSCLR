@@ -28,14 +28,37 @@ from eval.output import OutputManager
 logger = logging.getLogger(__name__)
 
 
+def get_model_cache_dir(cache_dir: str, model_name: str) -> str:
+    """根据模型名称获取对应的缓存目录"""
+    # 提取模型短名称
+    if "e5-mistral" in model_name.lower():
+        model_name_short = "e5-mistral-7b"
+    elif "bge-large" in model_name.lower():
+        model_name_short = "bge-large-en"
+    else:
+        # 默认使用模型名称的最后一部分
+        model_name_short = model_name.split("/")[-1].replace("-", "_")
+    
+    # 构建模型专属缓存目录
+    model_cache_dir = os.path.join(cache_dir, model_name_short)
+    return model_cache_dir, model_name_short
+
+
 def load_cached_embeddings(
     cache_dir: str,
-    task_name: str
+    task_name: str,
+    model_name: str = "bge-large-en"
 ) -> Optional[Tuple[torch.Tensor, List[str]]]:
-    """尝试加载缓存的文档向量"""
-    model_name_short = "bge-large-en"
-    cache_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
-    ids_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
+    """尝试加载缓存的文档向量
+    
+    Args:
+        cache_dir: 基础缓存目录
+        task_name: 任务名称
+        model_name: 模型名称，用于确定缓存子目录
+    """
+    model_cache_dir, model_name_short = get_model_cache_dir(cache_dir, model_name)
+    cache_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
+    ids_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
 
     if os.path.exists(cache_file) and os.path.exists(ids_file):
         logger.info(f"📂 加载缓存的文档向量: {cache_file}")
@@ -53,13 +76,23 @@ def save_embeddings_cache(
     cache_dir: str,
     task_name: str,
     embeddings: torch.Tensor,
-    doc_ids: List[str]
+    doc_ids: List[str],
+    model_name: str = "bge-large-en"
 ) -> None:
-    """保存文档向量到缓存"""
-    os.makedirs(cache_dir, exist_ok=True)
-    model_name_short = "bge-large-en"
-    cache_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
-    ids_file = os.path.join(cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
+    """保存文档向量到缓存
+    
+    Args:
+        cache_dir: 基础缓存目录
+        task_name: 任务名称
+        embeddings: 文档向量
+        doc_ids: 文档ID列表
+        model_name: 模型名称，用于确定缓存子目录
+    """
+    model_cache_dir, model_name_short = get_model_cache_dir(cache_dir, model_name)
+    os.makedirs(model_cache_dir, exist_ok=True)
+    
+    cache_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_embeddings.npy")
+    ids_file = os.path.join(model_cache_dir, f"{task_name}_{model_name_short}_corpus_ids.json")
 
     if isinstance(embeddings, torch.Tensor):
         embeddings_np = embeddings.cpu().numpy()
@@ -202,7 +235,7 @@ class FollowIREvaluatorEngine:
         
         cached_data = None
         if self.use_cache:
-            cached_data = load_cached_embeddings(self.cache_dir, self.task_name)
+            cached_data = load_cached_embeddings(self.cache_dir, self.task_name, self.model_name)
         
         if cached_data is not None:
             cached_embeddings, cached_doc_ids = cached_data
@@ -214,14 +247,28 @@ class FollowIREvaluatorEngine:
             else:
                 logger.warning(f"⚠️ 缓存文档ID不匹配，重新编码...")
                 doc_texts = [corpus[did]['text'] for did in all_doc_ids]
-                self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
-                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
+                # 使用检查点目录，每3个batch保存一次（按任务分子目录）
+                checkpoint_dir = os.path.join(self.cache_dir, "checkpoints", self.task_name)
+                checkpoint_interval = self.batch_size * 3  # 3个batch
+                self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size, checkpoint_dir=checkpoint_dir, checkpoint_interval=checkpoint_interval)
+                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids, self.model_name)
+                # 清理检查点文件
+                import shutil
+                if os.path.exists(checkpoint_dir):
+                    shutil.rmtree(checkpoint_dir)
         else:
             logger.info("📚 编码候选文档...")
             doc_texts = [corpus[did]['text'] for did in all_doc_ids]
-            self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size)
+            # 使用检查点目录，每3个batch保存一次（按任务分子目录）
+            checkpoint_dir = os.path.join(self.cache_dir, "checkpoints", self.task_name)
+            checkpoint_interval = self.batch_size * 3  # 3个batch
+            self.retriever.index_documents(all_doc_ids, doc_texts, self.batch_size, checkpoint_dir=checkpoint_dir, checkpoint_interval=checkpoint_interval)
             if self.use_cache:
-                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids)
+                save_embeddings_cache(self.cache_dir, self.task_name, self.retriever.doc_embeddings, self.retriever.doc_ids, self.model_name)
+                # 清理检查点文件
+                import shutil
+                if os.path.exists(checkpoint_dir):
+                    shutil.rmtree(checkpoint_dir)
         
         logger.info("🔍 执行检索: og 查询...")
         results_og = self._run_retrieval(q_og, candidates)
