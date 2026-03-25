@@ -786,7 +786,274 @@ class GridSearchEngine:
             "scores_og": results_og,
             "scores_changed": results_changed
         }
-    
+
+    def _evaluate_params_pat(
+        self,
+        q_og_emb: torch.Tensor,
+        q_plus_changed_emb: torch.Tensor,
+        q_minus_changed_emb: torch.Tensor,
+        candidates: Dict,
+        corpus: Dict,
+        alpha: float,
+        tau_base: float,
+        lambda_weight: float,
+        q_og_qid_to_idx: Dict[str, int],
+        q_changed_qid_to_idx: Dict[str, int],
+        neg_mask: torch.Tensor
+    ) -> Dict:
+        """
+        PAT (Positive-Aware Tolerance) 评估
+
+        使用正向得分自适应调整阈值:
+        dynamic_tau = tau_base + lambda_weight * S_base
+        penalty = alpha * relu(S_neg - dynamic_tau)
+        S_final = S_base - penalty
+        """
+        from eval.pat_scorer import PAT_Scorer
+
+        results_og = {}
+        results_changed = {}
+
+        qids = list(candidates.keys())
+
+        for qid in qids:
+            doc_ids = candidates[qid]
+
+            doc_emb_list = []
+            for did in doc_ids:
+                doc_emb_list.append(self.retriever.doc_embeddings[did])
+            doc_emb = torch.stack(doc_emb_list).to(self.device)
+
+            og_qid = f"{qid}-og"
+            changed_qid = f"{qid}-changed"
+            og_idx = q_og_qid_to_idx.get(og_qid, 0)
+            changed_idx = q_changed_qid_to_idx.get(changed_qid, 0)
+
+            og_emb = q_og_emb[og_idx].to(self.device)
+            q_plus_emb = q_plus_changed_emb[changed_idx].to(self.device)
+            q_minus_emb = q_minus_changed_emb[changed_idx].to(self.device)
+
+            neg_mask_val = neg_mask[changed_idx].item()
+
+            sim_og = torch.matmul(og_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+            S_base = torch.matmul(q_plus_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+            S_neg = torch.matmul(q_minus_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+
+            scores_og = sim_og.cpu().numpy()
+
+            if neg_mask_val > 0:
+                # 【PAT核心】动态阈值计算
+                dynamic_tau = tau_base + lambda_weight * S_base
+                penalty = alpha * torch.relu(S_neg - dynamic_tau)
+                scores_changed = (S_base - penalty).cpu().numpy()
+            else:
+                scores_changed = S_base.cpu().numpy()
+
+            results_og[f"{qid}-og"] = {did: float(scores_og[i]) for i, did in enumerate(doc_ids)}
+            results_changed[f"{qid}-changed"] = {did: float(scores_changed[i]) for i, did in enumerate(doc_ids)}
+
+        metrics = self.evaluator.evaluate(results_og, results_changed)
+
+        return {
+            "p_mrr": metrics.get("p-MRR", 0.0),
+            "og_ndcg@5": metrics.get("original", {}).get("ndcg_at_5", 0.0),
+            "changed_ndcg@5": metrics.get("changed", {}).get("ndcg_at_5", 0.0),
+            "og_mrr": metrics.get("original", {}).get("mrr_at_10", 0.0),
+            "changed_mrr": metrics.get("changed", {}).get("mrr_at_10", 0.0),
+            "full_metrics": metrics,
+            "scores_og": results_og,
+            "scores_changed": results_changed
+        }
+
+    def _evaluate_params_pat_protected(
+        self,
+        q_og_emb: torch.Tensor,
+        q_plus_changed_emb: torch.Tensor,
+        q_minus_changed_emb: torch.Tensor,
+        candidates: Dict,
+        corpus: Dict,
+        alpha: float,
+        tau_base: float,
+        lambda_weight: float,
+        q_og_qid_to_idx: Dict[str, int],
+        q_changed_qid_to_idx: Dict[str, int],
+        neg_mask: torch.Tensor,
+        top_k: int = 5,
+        protection_factor: float = 0.3
+    ) -> Dict:
+        """
+        PAT 评估 + OG排名保护分段惩罚
+
+        策略:
+        - og_rank <= top_k: 保护文档，penalty * protection_factor
+        - og_rank > top_k: 正常惩罚
+        """
+        from eval.pat_scorer import PAT_Scorer
+        import numpy as np
+
+        results_og = {}
+        results_changed = {}
+        og_ranks_map = {}
+
+        qids = list(candidates.keys())
+
+        for qid in qids:
+            doc_ids = candidates[qid]
+            doc_emb_list = []
+            for did in doc_ids:
+                doc_emb_list.append(self.retriever.doc_embeddings[did])
+            doc_emb = torch.stack(doc_emb_list).to(self.device)
+
+            og_qid = f"{qid}-og"
+            changed_qid = f"{qid}-changed"
+            og_idx = q_og_qid_to_idx.get(og_qid, 0)
+            changed_idx = q_changed_qid_to_idx.get(changed_qid, 0)
+
+            og_emb = q_og_emb[og_idx].to(self.device)
+            q_plus_emb = q_plus_changed_emb[changed_idx].to(self.device)
+            q_minus_emb = q_minus_changed_emb[changed_idx].to(self.device)
+
+            neg_mask_val = neg_mask[changed_idx].item()
+
+            sim_og = torch.matmul(og_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+            S_base = torch.matmul(q_plus_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+            S_neg = torch.matmul(q_minus_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+
+            scores_og_np = sim_og.cpu().numpy()
+
+            og_sorted_indices = np.argsort(-scores_og_np)
+            og_ranks = np.zeros(len(doc_ids), dtype=np.int32)
+            for rank, idx in enumerate(og_sorted_indices):
+                og_ranks[idx] = rank + 1
+
+            og_ranks_map[changed_qid] = og_ranks
+
+            if neg_mask_val > 0:
+                S_base_np = S_base.cpu().numpy()
+                S_neg_np = S_neg.cpu().numpy()
+                scores_changed_np = PAT_Scorer.compute_with_og_rank_protection(
+                    S_base=S_base_np,
+                    S_neg=S_neg_np,
+                    og_ranks=og_ranks,
+                    alpha=alpha,
+                    tau_base=tau_base,
+                    lambda_weight=lambda_weight,
+                    top_k=top_k,
+                    protection_factor=protection_factor
+                )
+            else:
+                scores_changed_np = S_base.cpu().numpy()
+
+            results_og[f"{qid}-og"] = {did: float(scores_og_np[i]) for i, did in enumerate(doc_ids)}
+            results_changed[f"{qid}-changed"] = {did: float(scores_changed_np[i]) for i, did in enumerate(doc_ids)}
+
+        metrics = self.evaluator.evaluate(results_og, results_changed)
+
+        return {
+            "p_mrr": metrics.get("p-MRR", 0.0),
+            "og_ndcg@5": metrics.get("original", {}).get("ndcg_at_5", 0.0),
+            "changed_ndcg@5": metrics.get("changed", {}).get("ndcg_at_5", 0.0),
+            "og_mrr": metrics.get("original", {}).get("mrr_at_10", 0.0),
+            "changed_mrr": metrics.get("changed", {}).get("mrr_at_10", 0.0),
+            "full_metrics": metrics,
+            "scores_og": results_og,
+            "scores_changed": results_changed
+        }
+
+    def _evaluate_params_pat_hybrid(
+        self,
+        q_og_emb: torch.Tensor,
+        q_plus_changed_emb: torch.Tensor,
+        q_minus_changed_emb: torch.Tensor,
+        candidates: Dict,
+        corpus: Dict,
+        alpha: float,
+        tau_base: float,
+        lambda_weight: float,
+        q_og_qid_to_idx: Dict[str, int],
+        q_changed_qid_to_idx: Dict[str, int],
+        neg_mask: torch.Tensor,
+        top_k: int = 5,
+        protection_factor: float = 0.3,
+        boost_ndcg_factor: float = 0.5
+    ) -> Dict:
+        """
+        PAT 评估 + 混合策略
+
+        策略:
+        1. 保护 og_rank <= top_k 的文档
+        2. 对 og_rank 5-20 的文档进行轻微 boost
+        """
+        from eval.pat_scorer import PAT_Scorer
+        import numpy as np
+
+        results_og = {}
+        results_changed = {}
+
+        qids = list(candidates.keys())
+
+        for qid in qids:
+            doc_ids = candidates[qid]
+            doc_emb_list = []
+            for did in doc_ids:
+                doc_emb_list.append(self.retriever.doc_embeddings[did])
+            doc_emb = torch.stack(doc_emb_list).to(self.device)
+
+            og_qid = f"{qid}-og"
+            changed_qid = f"{qid}-changed"
+            og_idx = q_og_qid_to_idx.get(og_qid, 0)
+            changed_idx = q_changed_qid_to_idx.get(changed_qid, 0)
+
+            og_emb = q_og_emb[og_idx].to(self.device)
+            q_plus_emb = q_plus_changed_emb[changed_idx].to(self.device)
+            q_minus_emb = q_minus_changed_emb[changed_idx].to(self.device)
+
+            neg_mask_val = neg_mask[changed_idx].item()
+
+            sim_og = torch.matmul(og_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+            S_base = torch.matmul(q_plus_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+            S_neg = torch.matmul(q_minus_emb.unsqueeze(0), doc_emb.T).squeeze(0)
+
+            scores_og_np = sim_og.cpu().numpy()
+
+            og_sorted_indices = np.argsort(-scores_og_np)
+            og_ranks = np.zeros(len(doc_ids), dtype=np.int32)
+            for rank, idx in enumerate(og_sorted_indices):
+                og_ranks[idx] = rank + 1
+
+            if neg_mask_val > 0:
+                S_base_np = S_base.cpu().numpy()
+                S_neg_np = S_neg.cpu().numpy()
+                scores_changed_np = PAT_Scorer.compute_hybrid(
+                    S_base=S_base_np,
+                    S_neg=S_neg_np,
+                    og_ranks=og_ranks,
+                    alpha=alpha,
+                    tau_base=tau_base,
+                    lambda_weight=lambda_weight,
+                    top_k=top_k,
+                    protection_factor=protection_factor,
+                    boost_ndcg_factor=boost_ndcg_factor
+                )
+            else:
+                scores_changed_np = S_base.cpu().numpy()
+
+            results_og[f"{qid}-og"] = {did: float(scores_og_np[i]) for i, did in enumerate(doc_ids)}
+            results_changed[f"{qid}-changed"] = {did: float(scores_changed_np[i]) for i, did in enumerate(doc_ids)}
+
+        metrics = self.evaluator.evaluate(results_og, results_changed)
+
+        return {
+            "p_mrr": metrics.get("p-MRR", 0.0),
+            "og_ndcg@5": metrics.get("original", {}).get("ndcg_at_5", 0.0),
+            "changed_ndcg@5": metrics.get("changed", {}).get("ndcg_at_5", 0.0),
+            "og_mrr": metrics.get("original", {}).get("mrr_at_10", 0.0),
+            "changed_mrr": metrics.get("changed", {}).get("mrr_at_10", 0.0),
+            "full_metrics": metrics,
+            "scores_og": results_og,
+            "scores_changed": results_changed
+        }
+
     def _detect_bad_cases(
         self,
         qids: List[str],

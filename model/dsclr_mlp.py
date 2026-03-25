@@ -44,23 +44,30 @@ class DSCLR_MLP(nn.Module):
 
     def forward(self, v_q_minus, encoder_type='bge'):
         """
-        支持 BGE 和 Mistral 两种模式的动态参数预测
+        支持 BGE、Mistral 和 RepLLaMA 三种模式的动态参数预测
         
         Args:
             v_q_minus: Q- 查询的 embedding
-            encoder_type: 'bge' 或 'mistral'，决定使用哪种参数约束策略
+            encoder_type: 'bge'、'mistral' 或 'repllama'，决定使用哪种参数约束策略
         """
         out = self.net(v_q_minus)
         
         alpha_raw = out[:, 0]
         tau_raw = out[:, 1]
         
-        if encoder_type == 'mistral':
-            # ========== Mistral 模式：终极微调 ==========
-            # 【终极微调】Alpha 最大火力进一步下压到 1.2，实现 Precision-Recall 平衡
+        if encoder_type == 'repllama':
+            # ========== RepLLaMA 模式：黄金中心点对齐 ==========
+            # 动态 Alpha 映射：上限为 4.0，当网络初始输出为 0 时，sigmoid(0)=0.5，此时 Alpha = 4.0 * 0.5 = 2.0（完美命中黄金中心点）
+            alpha = 4.0 * torch.sigmoid(alpha_raw)
+
+            # 动态 Tau 映射：搜索空间为 [0.50, 0.90]，跨度为 0.40，当网络初始输出为 0 时，sigmoid(0)=0.5，此时 Tau = 0.50 + (0.40 * 0.5) = 0.70（完美命中黄金中心点）
+            tau = 0.50 + 0.40 * torch.sigmoid(tau_raw)
+        elif encoder_type == 'mistral':
+            # ========== Mistral 模式：保持原有配置 ==========
+            # Alpha 最大火力锁定在 1.2
             alpha = 1.2 * torch.sigmoid(alpha_raw)
             
-            # 【终极微调】Tau 底盘抬高到 0.45，减少开火频率
+            # Tau 底盘抬高到 0.45
             # Tau 范围: [0.45, 0.85]
             tau = 0.45 + 0.4 * torch.sigmoid(tau_raw)
         else:
