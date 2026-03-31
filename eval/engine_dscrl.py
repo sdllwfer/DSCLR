@@ -1720,7 +1720,7 @@ class DSCLREvaluatorEngine:
                 
                 irrelevant_docs.append({
                     'doc_id': doc_id,
-                    'S_neg_proj': 0.0,
+                    'S_neg_proj': float(score),  # 使用实际的 S_neg_proj 得分
                     'snippet': doc_text[:150]
                 })
         
