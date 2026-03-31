@@ -24,31 +24,27 @@ echo "✅ 已激活环境: $CONDA_DEFAULT_ENV"
 echo "✅ Python 路径: $(which python)"
 
 # ============================================================
-# 额外参数配置（灵活扩展，支持任意模块）
+# 模块开关配置（独立控制，自由组合）
 # ============================================================
-# 在这个变量中添加任意额外的命令行参数
-# 例如：
-#   EXTRA_ARGS="--lap_model_path path/to/lap.pt"
-#   EXTRA_ARGS="--mlp_model_path path/to/mlp.pt --mlp_hidden_dim 256"
-#   EXTRA_ARGS="--lap_model_path path/to/lap.pt --mlp_model_path path/to/mlp.pt"
-#   EXTRA_ARGS="--new_module_path path/to/new.pt"  # 未来新模块
-#
-EXTRA_ARGS=""
+# USE_LAP: 是否使用 LAP 模块（true/false）
+#   true  - 使用 LAP 投影负向查询
+#   false - 不使用 LAP
+USE_LAP=false
+
+# USE_MLP: 是否使用 MLP 模块（true/false）
+#   true  - 使用 MLP 动态预测 alpha/tau
+#   false - 使用网格搜索（静态 alpha/tau）
+USE_MLP=false
 
 # ============================================================
-# 常用配置模板（取消注释即可使用）
+# 模型路径配置（根据上面的开关设置）
 # ============================================================
-# 模板1: DSCLR 基础模式（网格搜索，无需额外参数）
-# EXTRA_ARGS=""
-
-# 模板2: DSCLR+MLP 模式
-# EXTRA_ARGS="--mlp_model_path train/output/mlp_best.pt --mlp_hidden_dim 256"
-
-# 模板3: DSCLR+LAP 模式
-# EXTRA_ARGS="--lap_model_path train/output/lap_best.pt"
-
-# 模板4: DeIR 模式（LAP + MLP）
-# EXTRA_ARGS="--lap_model_path train/output/lap_best.pt --mlp_model_path train/output/mlp_best.pt --mlp_hidden_dim 256"
+# LAP 模型路径（USE_LAP=true 时需要）
+LAP_MODEL_PATH=""
+# MLP 模型路径（USE_MLP=true 时需要）
+MLP_MODEL_PATH=""
+# MLP 隐藏层维度
+MLP_HIDDEN_DIM=256
 
 # ============================================================
 # 编码器类型配置: "bge", "mistral" 或 "repllama"
@@ -230,6 +226,23 @@ if [[ ! " ${VALID_TASKS[@]} " =~ " ${TASK} " ]]; then
     exit 1
 fi
 
+# 根据开关检查模型路径
+if [ "$USE_LAP" = "true" ]; then
+    if [ -z "$LAP_MODEL_PATH" ] || [ ! -f "$LAP_MODEL_PATH" ]; then
+        echo "❌ 错误: USE_LAP=true 需要提供有效的 LAP_MODEL_PATH"
+        echo "当前路径: $LAP_MODEL_PATH"
+        exit 1
+    fi
+fi
+
+if [ "$USE_MLP" = "true" ]; then
+    if [ -z "$MLP_MODEL_PATH" ] || [ ! -f "$MLP_MODEL_PATH" ]; then
+        echo "❌ 错误: USE_MLP=true 需要提供有效的 MLP_MODEL_PATH"
+        echo "当前路径: $MLP_MODEL_PATH"
+        exit 1
+    fi
+fi
+
 # 如果设置了自定义输出路径，则使用它
 if [ -n "$CUSTOM_OUTPUT_DIR" ]; then
     OUTPUT_DIR="$CUSTOM_OUTPUT_DIR"
@@ -251,13 +264,19 @@ DSCLR 实验配置
 实验时间: $(date '+%Y-%m-%d %H:%M:%S')
 输出目录: ${OUTPUT_DIR}
 
-额外参数:
-  ${EXTRA_ARGS:-无}
+模块配置:
+  USE_LAP: ${USE_LAP}
+  USE_MLP: ${USE_MLP}
 
 编码器配置:
   ENCODER_TYPE: ${ENCODER_TYPE}
   MODEL_NAME: ${MODEL_NAME}
   EMBED_DIM: ${EMBED_DIM}
+
+模型路径:
+  LAP_MODEL_PATH: ${LAP_MODEL_PATH:-未使用}
+  MLP_MODEL_PATH: ${MLP_MODEL_PATH:-未使用}
+  MLP_HIDDEN_DIM: ${MLP_HIDDEN_DIM}
 
 网格搜索参数:
   ALPHAS: ${ALPHAS}
@@ -282,15 +301,20 @@ cat "${CONFIG_FILE}"
 # ============================================================
 echo ""
 echo "============================================================"
-if [ -n "$EXTRA_ARGS" ]; then
-    echo "开始运行 DSCLR 实验 [额外参数: ${EXTRA_ARGS}]"
-else
-    echo "开始运行 DSCLR 实验 [基础模式]"
-fi
+echo "开始运行 DSCLR 实验 [USE_LAP=${USE_LAP}, USE_MLP=${USE_MLP}]"
 echo "============================================================"
 
 # 记录开始时间
 start_time=$(date +%s)
+
+# 根据开关构建参数
+EXTRA_ARGS=""
+if [ "$USE_LAP" = "true" ]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --lap_model_path ${LAP_MODEL_PATH}"
+fi
+if [ "$USE_MLP" = "true" ]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --mlp_model_path ${MLP_MODEL_PATH} --mlp_hidden_dim ${MLP_HIDDEN_DIM}"
+fi
 
 # 运行实验
 echo "运行命令:"
