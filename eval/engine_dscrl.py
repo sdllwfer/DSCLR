@@ -621,9 +621,14 @@ class DSCLREvaluatorEngine:
                 if doc_id not in candidates_with_text:
                     candidates_with_text[doc_id] = corpus.get(doc_id, {'text': ''})
         
+        # 构建 q_minus_map 用于坏例分析
+        q_minus_map = {}
+        for i, qid in enumerate(query_ids_changed):
+            q_minus_map[qid] = q_minus_list_changed[i]
+        
         self._generate_bad_case_analysis(
             all_query_metrics, q_raw_og, q_raw_changed, 
-            candidates_with_text, all_results
+            candidates_with_text, all_results, q_minus_map
         )
 
         # 保存 TREC 格式文件
@@ -1098,7 +1103,8 @@ class DSCLREvaluatorEngine:
         q_raw_og: Dict[str, Tuple[str, str]],
         q_raw_changed: Dict[str, Tuple[str, str]],
         candidates: Dict[str, Any],
-        all_results: List[Dict[str, Any]]
+        all_results: List[Dict[str, Any]],
+        q_minus_map: Dict[str, str]
     ) -> None:
         """生成极端坏例分析诊断报告"""
         report_path = os.path.join(self.output_dir, "bad_case_analysis.md")
@@ -1110,7 +1116,7 @@ class DSCLREvaluatorEngine:
             
             report_data = self._analyze_extreme_cases(
                 all_query_metrics, q_raw_og, q_raw_changed, 
-                candidates, all_results
+                candidates, all_results, q_minus_map
             )
             
             f.write(report_data['markdown'])
@@ -1128,7 +1134,8 @@ class DSCLREvaluatorEngine:
         q_raw_og: Dict[str, Tuple[str, str]],
         q_raw_changed: Dict[str, Tuple[str, str]],
         candidates: Dict[str, Any],
-        all_results: List[Dict[str, Any]]
+        all_results: List[Dict[str, Any]],
+        q_minus_map: Dict[str, str]
     ) -> Dict[str, Any]:
         """分析极端坏例"""
         
@@ -1144,7 +1151,7 @@ class DSCLREvaluatorEngine:
         og_metrics = [m for m in all_query_metrics if m['query_type'] == 'og' and m['k'] == 5]
         
         query_neg_scores = self._compute_query_negative_scores(
-            q_raw_changed, candidates, all_results
+            q_raw_changed, candidates, all_results, q_minus_map
         )
         
         selected_queries = self._select_extreme_queries(
@@ -1169,14 +1176,19 @@ class DSCLREvaluatorEngine:
         self,
         q_raw_changed: Dict[str, Tuple[str, str]],
         candidates: Dict[str, Any],
-        all_results: List[Dict[str, Any]]
+        all_results: List[Dict[str, Any]],
+        q_minus_map: Dict[str, str]
     ) -> Dict[str, Dict[str, float]]:
-        """计算每个Query的正负向得分"""
+        """计算每个Query的正负向得分 - 使用 reformulator 提取的 Q-"""
         
         alpha_0_result = next((r for r in all_results if r['alpha'] == 0.0), None)
         
         if not alpha_0_result:
             return {}
+        
+        from eval.metrics.evaluator import DataLoader
+        data_loader = DataLoader(self.task_name)
+        qrels = data_loader.load_qrels()
         
         query_neg_scores = {}
         
@@ -1186,27 +1198,46 @@ class DSCLREvaluatorEngine:
             if changed_key not in q_raw_changed:
                 continue
             
-            query, negative_words = q_raw_changed[changed_key]
+            # 从 q_minus_map 获取 reformulator 提取的 Q-
+            q_minus = q_minus_map.get(changed_key, "[NONE]")
             
-            if not negative_words:
-                query_neg_scores[qid] = {'pos_score': 0.0, 'neg_scores': []}
+            if q_minus == "[NONE]" or not q_minus:
+                query_neg_scores[qid] = {
+                    'neg_words': [],
+                    'doc_scores': {},
+                    'relevant_docs': set(),
+                    'irrelevant_docs': set()
+                }
                 continue
             
-            neg_words_list = [w.strip() for w in negative_words.split(',')]
+            # Q- 是逗号分隔的负向词列表
+            neg_words_list = [w.strip() for w in q_minus.split(',') if w.strip()]
             
             query_neg_scores[qid] = {
                 'neg_words': neg_words_list,
-                'doc_scores': {}
+                'doc_scores': {},
+                'relevant_docs': set(),
+                'irrelevant_docs': set()
             }
             
             results_changed = alpha_0_result.get('results_changed', {})
             
-            changed_key = f"{qid}-changed"
-            if changed_key in results_changed:
-                for doc_id, score in results_changed[changed_key][:50]:
+            changed_key_result = f"{qid}-changed"
+            if changed_key_result in results_changed:
+                for doc_id, score in results_changed[changed_key_result][:50]:
                     doc = candidates.get(doc_id, {})
                     doc_text = doc.get('text', '') if isinstance(doc, dict) else str(doc)
                     
+                    # 从 qrels 获取相关性标注
+                    qrel_key = f"{qid}-changed"
+                    relevance = qrels.get(qrel_key, {}).get(doc_id, 0)
+                    
+                    if relevance > 0:
+                        query_neg_scores[qid]['relevant_docs'].add(doc_id)
+                    else:
+                        query_neg_scores[qid]['irrelevant_docs'].add(doc_id)
+                    
+                    # 检查文档是否包含负向词
                     neg_word_found = None
                     for neg_word in neg_words_list:
                         if neg_word.lower() in doc_text.lower():
@@ -1347,13 +1378,15 @@ class DSCLREvaluatorEngine:
         for qid, scores, qtype in selected_queries:
             changed_key = f"{qid}-changed"
             raw = q_raw_changed.get(changed_key, ("", ""))
-            query_text, neg_words = raw
+            query_text, _ = raw
             
             neg_info = query_neg_scores.get(qid, {})
+            neg_words_list = neg_info.get('neg_words', [])
+            q_minus = ', '.join(neg_words_list) if neg_words_list else '[NONE]'
             
             markdown += f"### {type_names.get(qtype, qtype)} - Q{qid}\n\n"
             markdown += f"**Query**: {query_text}\n\n"
-            markdown += f"**负向词**: {neg_words}\n\n"
+            markdown += f"**负向词 (Q-)**: {q_minus}\n\n"
             markdown += f"**当前MRR**: {scores['mrr']:.4f}\n\n"
             markdown += f"**平均负向得分**: {scores['avg_neg_score']:.4f}\n\n"
             
@@ -1456,15 +1489,17 @@ class DSCLREvaluatorEngine:
         for qid, scores, qtype in selected_queries:
             changed_key = f"{qid}-changed"
             raw = q_raw_changed.get(changed_key, ("", ""))
-            query_text, neg_words = raw
+            query_text, _ = raw
             
             neg_info = query_neg_scores.get(qid, {})
+            neg_words_list = neg_info.get('neg_words', [])
+            q_minus = ', '.join(neg_words_list) if neg_words_list else '[NONE]'
             
             query_data = {
                 'qid': qid,
                 'type': type_names.get(qtype, qtype),
                 'query': query_text,
-                'negative_words': neg_words,
+                'negative_words': q_minus,
                 'current_mrr': float(scores['mrr']),
                 'avg_neg_score': float(scores['avg_neg_score']),
                 'data_group_A': [],
