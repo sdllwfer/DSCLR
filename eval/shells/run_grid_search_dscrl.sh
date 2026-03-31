@@ -24,20 +24,24 @@ echo "✅ 已激活环境: $CONDA_DEFAULT_ENV"
 echo "✅ Python 路径: $(which python)"
 
 # ============================================================
-# 运行模式配置: "base", "mlp", "lap", "deir"
-#   base - DSCLR 基础模式（网格搜索）
-#   mlp  - DSCLR+MLP 模式（MLP 动态预测 alpha/tau）
-#   lap  - DSCLR+LAP 模式（LAP 投影 + 网格搜索）
-#   deir - DeIR 模式（LAP + MLP）
+# 模块开关配置（独立控制，自由组合）
 # ============================================================
-RUN_MODE="base"  # 修改这里切换模式
+# USE_LAP: 是否使用 LAP 模块（true/false）
+#   true  - 使用 LAP 投影负向查询
+#   false - 不使用 LAP
+USE_LAP=false
+
+# USE_MLP: 是否使用 MLP 模块（true/false）
+#   true  - 使用 MLP 动态预测 alpha/tau
+#   false - 使用网格搜索（静态 alpha/tau）
+USE_MLP=false
 
 # ============================================================
-# 模型路径配置（根据 RUN_MODE 设置）
+# 模型路径配置（根据上面的开关设置）
 # ============================================================
-# LAP 模型路径（RUN_MODE="lap" 或 "deir" 时需要）
+# LAP 模型路径（USE_LAP=true 时需要）
 LAP_MODEL_PATH=""
-# MLP 模型路径（RUN_MODE="mlp" 或 "deir" 时需要）
+# MLP 模型路径（USE_MLP=true 时需要）
 MLP_MODEL_PATH=""
 # MLP 隐藏层维度
 MLP_HIDDEN_DIM=256
@@ -222,26 +226,18 @@ if [[ ! " ${VALID_TASKS[@]} " =~ " ${TASK} " ]]; then
     exit 1
 fi
 
-# 校验运行模式
-VALID_MODES=("base" "mlp" "lap" "deir")
-if [[ ! " ${VALID_MODES[@]} " =~ " ${RUN_MODE} " ]]; then
-    echo "❌ 错误: 无效运行模式 '$RUN_MODE'"
-    echo "可用模式: ${VALID_MODES[@]}"
-    exit 1
-fi
-
-# 根据模式检查模型路径
-if [ "$RUN_MODE" = "lap" ] || [ "$RUN_MODE" = "deir" ]; then
+# 根据开关检查模型路径
+if [ "$USE_LAP" = "true" ]; then
     if [ -z "$LAP_MODEL_PATH" ] || [ ! -f "$LAP_MODEL_PATH" ]; then
-        echo "❌ 错误: RUN_MODE='$RUN_MODE' 需要提供有效的 LAP_MODEL_PATH"
+        echo "❌ 错误: USE_LAP=true 需要提供有效的 LAP_MODEL_PATH"
         echo "当前路径: $LAP_MODEL_PATH"
         exit 1
     fi
 fi
 
-if [ "$RUN_MODE" = "mlp" ] || [ "$RUN_MODE" = "deir" ]; then
+if [ "$USE_MLP" = "true" ]; then
     if [ -z "$MLP_MODEL_PATH" ] || [ ! -f "$MLP_MODEL_PATH" ]; then
-        echo "❌ 错误: RUN_MODE='$RUN_MODE' 需要提供有效的 MLP_MODEL_PATH"
+        echo "❌ 错误: USE_MLP=true 需要提供有效的 MLP_MODEL_PATH"
         echo "当前路径: $MLP_MODEL_PATH"
         exit 1
     fi
@@ -268,11 +264,9 @@ DSCLR 实验配置
 实验时间: $(date '+%Y-%m-%d %H:%M:%S')
 输出目录: ${OUTPUT_DIR}
 
-运行模式: ${RUN_MODE}
-  base - DSCLR 基础模式（网格搜索）
-  mlp  - DSCLR+MLP 模式（MLP 动态预测）
-  lap  - DSCLR+LAP 模式（LAP 投影 + 网格搜索）
-  deir - DeIR 模式（LAP + MLP）
+模块配置:
+  USE_LAP: ${USE_LAP}
+  USE_MLP: ${USE_MLP}
 
 编码器配置:
   ENCODER_TYPE: ${ENCODER_TYPE}
@@ -307,18 +301,18 @@ cat "${CONFIG_FILE}"
 # ============================================================
 echo ""
 echo "============================================================"
-echo "开始运行 DSCLR 实验 [模式: ${RUN_MODE}]"
+echo "开始运行 DSCLR 实验 [USE_LAP=${USE_LAP}, USE_MLP=${USE_MLP}]"
 echo "============================================================"
 
 # 记录开始时间
 start_time=$(date +%s)
 
-# 根据模式构建参数
+# 根据开关构建参数
 EXTRA_ARGS=""
-if [ "$RUN_MODE" = "lap" ] || [ "$RUN_MODE" = "deir" ]; then
+if [ "$USE_LAP" = "true" ]; then
     EXTRA_ARGS="${EXTRA_ARGS} --lap_model_path ${LAP_MODEL_PATH}"
 fi
-if [ "$RUN_MODE" = "mlp" ] || [ "$RUN_MODE" = "deir" ]; then
+if [ "$USE_MLP" = "true" ]; then
     EXTRA_ARGS="${EXTRA_ARGS} --mlp_model_path ${MLP_MODEL_PATH} --mlp_hidden_dim ${MLP_HIDDEN_DIM}"
 fi
 
