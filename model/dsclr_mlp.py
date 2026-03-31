@@ -5,78 +5,53 @@ import torch.nn.functional as F
 
 class DSCLR_MLP(nn.Module):
     """
-    DSCLR 动态门控网络
-    
-    支持多种输入维度：
-    - BGE-large: 1024 维
-    - E5-Mistral-7B: 4096 维
-    
-    隐藏层维度根据输入维度自适应调整，保证充足的表达能力
+    基于语义相关度的认知路由器
+
+    MLP 的输入是拼接后的特征：
+    - q_neg_proj: 投影后的负向意图特征 (hidden_dim)
+    - correlation: q_pos 与 q_neg_proj 的余弦相似度 (1)
+
+    MLP 输出两个标量：
+    - raw_alpha: 经 SoftPlus 激活得到 alpha（惩罚力度）
+    - raw_tau: 经 Sigmoid 激活得到 tau（容忍底线）
     """
-    def __init__(self, input_dim=1024, hidden_dim=None):
+    def __init__(self, hidden_dim=1024):
         super().__init__()
-        self.input_dim = input_dim
-        
-        # 根据输入维度自适应设置隐藏层维度
-        if hidden_dim is None:
-            # 4096 维输入使用更大的隐藏层 (512)
-            # 1024 维输入使用标准隐藏层 (256)
-            if input_dim >= 4096:
-                hidden_dim = 512
-            elif input_dim >= 1024:
-                hidden_dim = 256
-            else:
-                hidden_dim = 128
-        
         self.hidden_dim = hidden_dim
-        
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
+
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim + 1, 128),
+            nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(128, 2)
         )
-        # tau 偏置初始化：-0.2 使得初始 tau ≈ 0.45
-        # S_base_neg 的范围是 [0.35, 0.63]，均值 0.44
-        # 初始 tau 应该略低于均值，惩罚那些过于相似的负样本
-        self.net[-1].bias.data[0] = 0.0   # alpha 偏置
-        self.net[-1].bias.data[1] = -0.2  # tau 偏置，初始 tau ≈ 0.45
 
-    def forward(self, v_q_minus, encoder_type='bge'):
+        self.mlp[-1].bias.data[0] = 0.5
+        self.mlp[-1].bias.data[1] = -0.5
+
+    def forward(self, q_pos_emb: torch.Tensor, q_neg_proj: torch.Tensor):
         """
-        支持 BGE、Mistral 和 RepLLaMA 三种模式的动态参数预测
-        
         Args:
-            v_q_minus: Q- 查询的 embedding
-            encoder_type: 'bge'、'mistral' 或 'repllama'，决定使用哪种参数约束策略
-        """
-        out = self.net(v_q_minus)
-        
-        alpha_raw = out[:, 0]
-        tau_raw = out[:, 1]
-        
-        if encoder_type == 'repllama':
-            # ========== RepLLaMA 模式：黄金中心点对齐 ==========
-            # 动态 Alpha 映射：上限为 4.0，当网络初始输出为 0 时，sigmoid(0)=0.5，此时 Alpha = 4.0 * 0.5 = 2.0（完美命中黄金中心点）
-            alpha = 4.0 * torch.sigmoid(alpha_raw)
+            q_pos_emb: 正向意图特征，Shape: [batch_size, hidden_dim]
+            q_neg_proj: 投影后的负向意图特征，Shape: [batch_size, hidden_dim]
 
-            # 动态 Tau 映射：搜索空间为 [0.50, 0.90]，跨度为 0.40，当网络初始输出为 0 时，sigmoid(0)=0.5，此时 Tau = 0.50 + (0.40 * 0.5) = 0.70（完美命中黄金中心点）
-            tau = 0.50 + 0.40 * torch.sigmoid(tau_raw)
-        elif encoder_type == 'mistral':
-            # ========== Mistral 模式：保持原有配置 ==========
-            # Alpha 最大火力锁定在 1.2
-            alpha = 1.2 * torch.sigmoid(alpha_raw)
-            
-            # Tau 底盘抬高到 0.45
-            # Tau 范围: [0.45, 0.85]
-            tau = 0.45 + 0.4 * torch.sigmoid(tau_raw)
-        else:
-            # ========== BGE 模式：保持原有配置 ==========
-            # Alpha: Scaled Sigmoid 锁定在 (0, 3.0)
-            alpha = 3.0 * torch.sigmoid(alpha_raw)
-            
-            # Tau: Sigmoid 激活，映射到 (0.3, 0.7)
-            tau = torch.sigmoid(tau_raw)
-            tau = torch.clamp(tau, min=0.3, max=0.7)
-        
+        Returns:
+            alpha: 惩罚力度，Shape: [batch_size]
+            tau: 容忍底线，Shape: [batch_size]
+        """
+        correlation = F.cosine_similarity(q_pos_emb, q_neg_proj, dim=-1).unsqueeze(-1)
+
+        mlp_input = torch.cat([q_neg_proj, correlation], dim=-1)
+
+        raw_output = self.mlp(mlp_input)
+
+        raw_alpha = raw_output[:, 0]
+        raw_tau = raw_output[:, 1]
+
+        # 使用 Sigmoid 限制 alpha 的范围在 (0, MAX_ALPHA)，防止模型通过无限放大惩罚来作弊
+        MAX_ALPHA = 2.0
+        alpha = torch.sigmoid(raw_alpha) * MAX_ALPHA
+
+        tau = torch.sigmoid(raw_tau)
+
         return alpha, tau

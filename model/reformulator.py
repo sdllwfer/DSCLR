@@ -15,25 +15,79 @@ logger = logging.getLogger(__name__)
 
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-e76614db92844a68bb36956b1e445c42")
 
-SYSTEM_PROMPT = """You are a query decoupling expert. Your task is to decompose a given Query and Instruction into two parts:
+SYSTEM_PROMPT = """You are an expert Information Retrieval (IR) query optimizer for Dense Vector Models.
+Your task is to decouple a user's "Original Query" and complex "Instruction" into two concise, NATURAL LANGUAGE representations: Q_plus and Q_minus.
 
-1. Q_plus (Positive Semantic Features): Describes the core needs and intents that the document should satisfy
-2. Q_minus (Negative Rejection Features): Describes features that the document should avoid (or "[NONE]" if none)
+⚠️ CRITICAL RULES FOR Q_plus (Positive Intent):
+1. Write a fluent, natural language phrase (e.g., "The effect of mobile phones on brain cancer incidence"). DO NOT output a robotic list of keywords.
+2. Semantic Topic ONLY. Strictly REMOVE all format-related noise (e.g., discard words like "articles", "documents", "news", "statistical studies", "experiments", "mentions", "reports").
+3. Remove all conversational connectors (e.g., "such as", "including new measures like", "specifically from"). Keep it a pure, fluent semantic query.
+4. Keep it sharp, grammatically coherent, and focused on the core topic.
 
-Output ONLY in the following JSON format, no other content:
-```json
+⚠️ CRITICAL RULES FOR Q_minus (Negative Constraints):
+1. Extract ONLY the most critical, high-level concepts to exclude. Do not create a massive, disjointed list of words.
+2. Use concise natural phrasing (e.g., "leukemia", "normal security screening methods", "land-bound sciences").
+3. If no explicit exclusion exists, output exactly "[NONE]".
+
+⚠️ CRITICAL RULES FOR Q_minus (The "No-Negation" Rule):
+1. DENSE RETRIEVERERS DO NOT UNDERSTAND LOGIC WORDS. You MUST NOT use negation words in Q_minus (e.g., "no", "not", "non-", "without", "outside", "other than").
+2. Convert logical negations into AFFIRMATIVE ENTITIES.
+   - BAD: "non-United Kingdom" -> GOOD: "United States, France, global"
+   - BAD: "violence outside Ireland" -> GOOD: "violence in England, international violence"
+   - BAD: "production without export" -> GOOD: "domestic production only"
+3. Output ONLY the exact entities/concepts to be excluded.
+
+Output strictly in JSON format:
 {
-  "Reasoning_Steps": "Your reasoning process",
-  "Q_plus": "The positive feature extracted",
-  "Q_minus": "The negative feature extracted or [NONE]"
+  "Reasoning_Steps": "1. Identify core topic. 2. Filter format noise. 3. Identify core exclusions (convert negations to affirmatives).",
+  "Q_plus": "Fluent, concise natural language query",
+  "Q_minus": "Concise core exclusions or [NONE]"
 }
-```
 
-Important:
-- If the Instruction has no explicit exclusion requirement, Q_minus should be "[NONE]"
-- Q_plus should clearly describe what the document should contain
-- Q_minus should explicitly describe what the document should avoid
-- Output in English"""
+---
+EXAMPLES:
+
+[Example 1: Removing Format Noise & Exact Negative]
+Original Query: Evidence that radio waves from radio towers or car (mobile) phones affect brain cancer occurrence.
+Instruction: Persons living near radio towers... A relevant document includes any experiment with animals, statistical study, articles, news items which report on the incidence... Any mentions of leukemia is not relevant.
+Output:
+{
+  "Reasoning_Steps": "1. Topic: radio waves from towers/phones and brain cancer. 2. Noise: 'experiment with animals, statistical study, articles, news items'. 3. Negative: leukemia.",
+  "Q_plus": "Association between radio waves from towers or mobile phones and brain cancer incidence",
+  "Q_minus": "leukemia"
+}
+
+[Example 2: Condensing the "Kitchen Sink" Negative]
+Original Query: Identify documents discussing the development and application of space-borne ocean remote sensing.
+Instruction: Documents discussing... in oceanography, seabed prospecting are relevant. Documents that discuss the application of satellite remote sensing in geography, agriculture, forestry, mining and mineral prospecting or any land-bound science are not relevant, nor are references to international marketing or promotional advertising... Information about temperature is not relevant.
+Output:
+{
+  "Reasoning_Steps": "1. Topic: space-borne ocean remote sensing in marine sciences. 2. Noise: 'Identify documents discussing', connectors like 'such as'. 3. Negative: Condense land-bound sciences and marketing (no negation words).",
+  "Q_plus": "Development and application of space-borne ocean remote sensing in oceanography and seabed prospecting",
+  "Q_minus": "land-bound sciences, agriculture, marketing, temperature"
+}
+
+[Example 3: Handling Negation Conversion & Fluent Q+]
+Original Query: Find documents which describe an advantage in hiring potential or increased income for graduates of U.S. colleges.
+Instruction: Relevant documents cite some advantage... Documents citing better opportunities for non-college vocational-training is not relevant. I do not trust colleges in Manhattan as they have a different economy, so find documents that do not cite or discuss these colleges (e.g. Columbia, etc.).
+Output:
+{
+  "Reasoning_Steps": "1. Topic: hiring potential and income advantages for US college graduates. 2. Noise: 'Find documents which describe', 'I do not trust'. 3. Negative: Convert 'non-college vocational training' to 'college vocational training only' and 'Manhattan colleges like Columbia' stays.",
+  "Q_plus": "Advantage in hiring potential and increased income for United States college graduates",
+  "Q_minus": "college vocational training only, Manhattan colleges such as Columbia"
+}
+
+[Example 4: The NO Negative Case]
+Original Query: What is the ongoing status of The Three Gorges Project?
+Instruction: A relevant document will provide the projected or actual date of completion of the project, its estimated or actual total cost...
+Output:
+{
+  "Reasoning_Steps": "1. Topic: ongoing status of Three Gorges Project including completion date and cost. 2. Noise: 'A relevant document will provide'. 3. Negative: No exclusion mentioned.",
+  "Q_plus": "Ongoing status of the Three Gorges Project including projected completion date, total cost, and electrical output",
+  "Q_minus": "[NONE]"
+}
+
+Output in English."""
 
 USER_PROMPT_TEMPLATE = """Please analyze and decouple the following Query and Instruction:
 
@@ -177,7 +231,7 @@ class DualQueryCache:
     支持多任务区分、版本控制、高效查询
     """
     
-    def __init__(self, cache_dir: str = "dataset/FollowIR_test/dual_queries"):
+    def __init__(self, cache_dir: str = "dataset/FollowIR_test/dual_queries_v4"):
         self.cache_dir = cache_dir
         self._ensure_cache_dir()
     
@@ -187,7 +241,7 @@ class DualQueryCache:
     
     def _get_cache_file(self, task_name: str) -> str:
         """获取指定任务的缓存文件路径"""
-        return os.path.join(self.cache_dir, f"dual_queries_{task_name}.jsonl")
+        return os.path.join(self.cache_dir, f"dual_queries_v4_{task_name}.jsonl")
     
     def _get_version_file(self, task_name: str) -> str:
         """获取版本信息文件路径"""
@@ -281,7 +335,7 @@ class QueryReformulator:
         task_name: str = "Core17InstructionRetrieval",
         api_key: str = API_KEY,
         use_cache: bool = True,
-        cache_dir: str = "dataset/FollowIR_test/dual_queries",
+        cache_dir: str = "dataset/FollowIR_test/dual_queries_v4",
         max_retries: int = DEFAULT_MAX_RETRIES,
         initial_delay: float = DEFAULT_INITIAL_DELAY,
         max_delay: float = DEFAULT_MAX_DELAY,

@@ -262,7 +262,10 @@ class DSCLREvaluatorEngine:
         max_seq_length: Optional[int] = None,
         seed: int = 42,
         cache_dir: Optional[str] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        alphas: Optional[str] = None,
+        taus: Optional[str] = None,
+        num_samples: int = 15
     ):
         self.model_name = model_name
         self.task_name = task_name
@@ -275,13 +278,16 @@ class DSCLREvaluatorEngine:
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.use_cache = use_cache
 
-        # 网格搜索参数空间
-        self.alphas = [0.0, 0.5, 1.0, 2.0, 3.0, 5.0]
-        self.taus = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
-        
-        # 随机抽取15组参数进行测试
-        all_combinations = [(a, t) for a in self.alphas for t in self.taus]
-        self.param_combinations = random.sample(all_combinations, min(15, len(all_combinations)))
+        # 网格搜索参数空间（支持自定义）
+        default_alphas = "0.0,0.5,1.0,2.0,3.0,5.0"
+        default_taus = "0.5,0.6,0.7,0.8,0.9,0.95"
+
+        alphas_list = [float(a.strip()) for a in (alphas or default_alphas).split(",")]
+        taus_list = [float(t.strip()) for t in (taus or default_taus).split(",")]
+        self.num_samples = num_samples
+
+        all_combinations = [(a, t) for a in alphas_list for t in taus_list]
+        self.param_combinations = random.sample(all_combinations, min(self.num_samples, len(all_combinations)))
         logger.info(f"🎲 随机抽取 {len(self.param_combinations)} 组参数: {self.param_combinations}")
 
         self._setup_seed()
@@ -314,7 +320,7 @@ class DSCLREvaluatorEngine:
         self.reformulator = QueryReformulator(
             task_name=self.task_name,
             use_cache=True,
-            cache_dir="/home/luwa/Documents/DSCLR/dataset/FollowIR_test/dual_queries"
+            cache_dir="/home/luwa/Documents/DSCLR/dataset/FollowIR_test/dual_queries_v4"
         )
 
         # 创建检索器
@@ -393,9 +399,9 @@ class DSCLREvaluatorEngine:
             from model.dsclr_mlp import DSCLR_MLP
             
             # 根据模型名称确定嵌入维度
-            if "mistral" in self.model_name.lower():
+            if "mistral" in self.model_name.lower() or "repllama" in self.model_name.lower():
                 embed_dim = 4096
-                logger.info(f"   检测到 Mistral 模型，使用嵌入维度: {embed_dim}")
+                logger.info(f"   检测到 {self.model_name} 模型，使用嵌入维度: {embed_dim}")
             else:
                 embed_dim = 1024
                 logger.info(f"   使用默认嵌入维度: {embed_dim}")
@@ -455,25 +461,29 @@ class DSCLREvaluatorEngine:
         
         # 构建 changed 查询对 (使用 reformulator 实时解耦，需要 Q+ 和 Q-)
         logger.info("🔍 准备 changed 查询 (Q+ 和 Q-)...")
-        q_plus_list_changed, q_minus_list_changed, neg_mask_changed, query_ids_changed = self._prepare_dual_queries(q_changed, q_raw_changed)
+        q_plus_list_changed, q_minus_list_changed, q_original_list_changed, neg_mask_changed, query_ids_changed = self._prepare_dual_queries(q_changed, q_raw_changed)
 
         # 编码查询
         logger.info("🔍 编码 OG 查询 (仅 Q+)...")
         q_plus_embeddings_og = self._encode_queries(q_plus_list_og)
-        
-        logger.info("🔍 编码 Changed 查询 (Q+ 和 Q-)...")
+
+        logger.info("🔍 编码 Changed 查询 (Q+ 和 Q- 和原始查询)...")
         q_plus_embeddings_changed = self._encode_queries(q_plus_list_changed)
         q_minus_embeddings_changed = self._encode_queries(q_minus_list_changed)
+        q_original_embeddings_changed = self._encode_queries(q_original_list_changed)
 
         # 计算 og 得分矩阵 (仅 S_base，无 S_neg)
         logger.info("📊 计算 og 得分矩阵 (仅 S_base)...")
         S_base_og = self.retriever.compute_base_scores(q_plus_embeddings_og)
-        
-        # 计算 changed 得分矩阵 (S_base 和 S_neg)
-        logger.info("📊 计算 changed 得分矩阵...")
-        S_base_changed, S_neg_changed = self.retriever.compute_scores_matrix(
-            q_plus_embeddings_changed, q_minus_embeddings_changed, neg_mask_changed
-        )
+
+        # 计算 changed 得分矩阵
+        # S_base: 使用原始 query+instruction
+        # S_neg: 使用 Q- (负查询)
+        logger.info("📊 计算 changed 得分矩阵 (S_base=原查询, S_neg=Q-)...")
+        S_base_changed = self.retriever.compute_base_scores(q_original_embeddings_changed)
+        q_minus_embeddings_changed = q_minus_embeddings_changed.to(self.retriever.doc_embeddings.device)
+        S_neg_changed = torch.matmul(q_minus_embeddings_changed, self.retriever.doc_embeddings.T)
+        S_neg_changed = S_neg_changed * neg_mask_changed.unsqueeze(1)
 
         # 动态推理 或 静态网格搜索
         if self.use_mlp:
@@ -596,6 +606,9 @@ class DSCLREvaluatorEngine:
 
         # 保存结构化汇总文件
         self._save_structured_summary(best_metrics, all_query_metrics, q_raw_og, q_raw_changed)
+        
+        # 保存所有参数的简化汇总
+        self._save_all_params_summary(all_results)
 
         # 生成坏例分析报告
         self._generate_bad_case_analysis(all_query_metrics, q_raw_og, q_raw_changed)
@@ -684,20 +697,25 @@ class DSCLREvaluatorEngine:
         self,
         queries: Dict[str, str],
         raw_queries: Dict[str, Tuple[str, str]]
-    ) -> Tuple[List[str], List[str], torch.Tensor, List[str]]:
+    ) -> Tuple[List[str], List[str], List[str], torch.Tensor, List[str]]:
         """
         准备双流查询 - 使用 reformulator 实时解耦
-        返回: (q_plus_list, q_minus_list, neg_mask, query_ids)
+        返回: (q_plus_list, q_minus_list, q_original_list, neg_mask, query_ids)
+        其中 q_original_list 是原始 query + instruction，用于计算 S_base
         """
         query_ids = []
         q_plus_list = []
         q_minus_list = []
+        q_original_list = []
 
         for qid in queries.keys():
             # 获取原始 query 和 instruction
             raw = raw_queries.get(qid, ("", ""))
             query_text, instruction = raw[0], raw[1]
             
+            # 原始查询 = query + instruction（用于 S_base 计算）
+            q_original = f"{query_text} {instruction}".strip() if query_text else queries.get(qid, "")
+
             # 从 qid 提取 idx (格式: "1-og" -> idx=1)
             try:
                 idx = int(qid.split('-')[0])
@@ -719,6 +737,7 @@ class DSCLREvaluatorEngine:
             query_ids.append(qid)
             q_plus_list.append(q_plus)
             q_minus_list.append(q_minus)
+            q_original_list.append(q_original)
 
         # 【调试逻辑】强制 OG 查询跳过 MLP，即使 Q- 不为 None
         # 这样可以让 OG nDCG 与原始检索模型对比，验证掩码逻辑
@@ -740,7 +759,7 @@ class DSCLREvaluatorEngine:
         changed_count = len(query_ids) - og_count
         logger.info(f"【调试模式】OG 查询强制跳过 MLP: {og_count} 个, Changed 查询: {changed_count} 个")
 
-        return q_plus_list, q_minus_list, neg_mask, query_ids
+        return q_plus_list, q_minus_list, q_original_list, neg_mask, query_ids
 
     def _encode_queries(self, texts: List[str]) -> torch.Tensor:
         """编码查询（带 L2 归一化）"""
@@ -829,6 +848,48 @@ class DSCLREvaluatorEngine:
                 for rank, (doc_id, score) in enumerate(sorted_docs, start=1):
                     f.write(f"{qid} Q0 {doc_id} {rank} {score:.6f} dscrl\n")
         logger.info(f"✅ TREC 文件已保存: {output_path}")
+
+    def _save_all_params_summary(
+        self,
+        all_results: List[Dict[str, Any]]
+    ) -> None:
+        """保存所有参数的简化汇总"""
+        summary_path = os.path.join(self.output_dir, "all_params_summary.csv")
+        
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("alpha,tau,pMRR,og_nDCG1,og_nDCG5,og_nDCG10,og_nDCG100,og_MAP1,og_MAP5,og_MAP10,og_MAP100,changed_nDCG1,changed_nDCG5,changed_nDCG10,changed_nDCG100,changed_MAP1,changed_MAP5,changed_MAP10,changed_MAP100\n")
+            
+            for result in all_results:
+                alpha = result.get('alpha', 0)
+                tau = result.get('tau', 0)
+                p_mrr = result.get('p-MRR', 0)
+                metrics = result.get('metrics', {})
+                
+                full_scores = metrics.get('full_scores', {})
+                og_metrics = full_scores.get('og', {})
+                changed_metrics = full_scores.get('changed', {})
+                
+                line = f"{alpha},{tau},{p_mrr:.6f},"
+                line += f"{og_metrics.get('ndcg_at_1', 0):.6f},"
+                line += f"{og_metrics.get('ndcg_at_5', 0):.6f},"
+                line += f"{og_metrics.get('ndcg_at_10', 0):.6f},"
+                line += f"{og_metrics.get('ndcg_at_100', 0):.6f},"
+                line += f"{og_metrics.get('map_at_1', 0):.6f},"
+                line += f"{og_metrics.get('map_at_5', 0):.6f},"
+                line += f"{og_metrics.get('map_at_10', 0):.6f},"
+                line += f"{og_metrics.get('map_at_100', 0):.6f},"
+                line += f"{changed_metrics.get('ndcg_at_1', 0):.6f},"
+                line += f"{changed_metrics.get('ndcg_at_5', 0):.6f},"
+                line += f"{changed_metrics.get('ndcg_at_10', 0):.6f},"
+                line += f"{changed_metrics.get('ndcg_at_100', 0):.6f},"
+                line += f"{changed_metrics.get('map_at_1', 0):.6f},"
+                line += f"{changed_metrics.get('map_at_5', 0):.6f},"
+                line += f"{changed_metrics.get('map_at_10', 0):.6f},"
+                line += f"{changed_metrics.get('map_at_100', 0):.6f}\n"
+                
+                f.write(line)
+        
+        logger.info(f"💾 所有参数汇总已保存: {summary_path}")
 
     def _compute_per_query_metrics(
         self,
@@ -1138,7 +1199,10 @@ def run_dsclr_evaluation(
     cache_dir: Optional[str] = None,
     use_cache: bool = True,
     mlp_model_path: Optional[str] = None,
-    mlp_hidden_dim: int = 256
+    mlp_hidden_dim: int = 256,
+    alphas: Optional[str] = None,
+    taus: Optional[str] = None,
+    num_samples: int = 15
 ) -> Dict[str, Any]:
     """运行 DSCLR 评测的便捷函数"""
     engine = DSCLREvaluatorEngine(
@@ -1148,7 +1212,10 @@ def run_dsclr_evaluation(
         device=device,
         batch_size=batch_size,
         cache_dir=cache_dir,
-        use_cache=use_cache
+        use_cache=use_cache,
+        alphas=alphas,
+        taus=taus,
+        num_samples=num_samples
     )
     return engine.run(mlp_model_path=mlp_model_path, mlp_hidden_dim=mlp_hidden_dim)
 
@@ -1166,7 +1233,10 @@ if __name__ == "__main__":
     parser.add_argument("--use_cache", type=bool, default=True, help="是否使用缓存")
     parser.add_argument("--mlp_model_path", type=str, default=None, help="MLP模型路径 (可选，使用动态MLP推理)")
     parser.add_argument("--mlp_hidden_dim", type=int, default=256, help="MLP隐藏层维度 (默认: 256)")
-    
+    parser.add_argument("--alphas", type=str, default=None, help="Alpha 搜索范围，逗号分隔 (默认: 0.0,0.5,1.0,2.0,3.0,5.0)")
+    parser.add_argument("--taus", type=str, default=None, help="Tau 搜索范围，逗号分隔 (默认: 0.5,0.6,0.7,0.8,0.9,0.95)")
+    parser.add_argument("--num_samples", type=int, default=15, help="随机抽样数量 (默认: 15)")
+
     args = parser.parse_args()
     
     logging.basicConfig(
@@ -1183,6 +1253,9 @@ if __name__ == "__main__":
         cache_dir=args.cache_dir,
         use_cache=args.use_cache,
         mlp_model_path=args.mlp_model_path,
-        mlp_hidden_dim=args.mlp_hidden_dim
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        alphas=args.alphas,
+        taus=args.taus,
+        num_samples=args.num_samples
     )
     print(f"\n最终 p-MRR: {results['best_metrics'].get('p-MRR', 0):.4f}")

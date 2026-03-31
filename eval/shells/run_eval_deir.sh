@@ -54,16 +54,16 @@ elif [ "$ENCODER_TYPE" = "repllama" ]; then
     EMBED_DIM=4096
     MLP_HIDDEN_DIM=256
     MODEL_SHORT="repllama-v1-7b"
-    # DeIR 模型路径配置（默认使用最新训练的模型）
+    # DeIR 模型路径配置（使用最新训练的 Shield Loss 改进版 MLP）
     LAP_MODEL_PATH="train/output/Hybrid/lap_then_mlp/03.28-1145-repllama-LAPepoch5/lap_phase/deir_best_lap_phase.pt"
-    MLP_MODEL_PATH="train/output/Hybrid/lap_then_mlp/03.28-1145-repllama-LAPepoch5/mlp_phase/deir_best_mlp_phase.pt"
+    MLP_MODEL_PATH="train/output/Hybrid/lap_then_mlp/03.28-1723-repllama-单MLP损失改进/mlp_phase/deir_best_mlp_phase.pt"
 else
     echo "错误: 未知的编码器类型 '$ENCODER_TYPE'"
     echo "支持的类型: bge, mistral, repllama"
     exit 1
 fi
 
-GPU_ID=2
+GPU_ID=3
 SEED=42
 VERBOSE=false
 TASK="Core17InstructionRetrieval"
@@ -72,7 +72,7 @@ TASK="Core17InstructionRetrieval"
 
 # 输出路径 (指定 CUSTOM_OUTPUT_PATH 后直接使用，否则自动生成)
 OUTPUT_BASE_DIR="/home/luwa/Documents/DSCLR/evaluation/deir"
-CUSTOM_OUTPUT_PATH=""
+CUSTOM_OUTPUT_PATH="/home/luwa/Documents/DSCLR/evaluation/deir/3.28-${ENCODER_TYPE}_${TASK}_ShieldLoss改进版"
 
 # ============================================================
 # 显示帮助信息
