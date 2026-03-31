@@ -561,7 +561,10 @@ class DSCLREvaluatorEngine:
                         'p-MRR': p_mrr,
                         'og_nDCG@5': og_ndcg,
                         'changed_nDCG@5': changed_ndcg,
-                        'metrics': metrics
+                        'metrics': metrics,
+                        'results_changed': {qid: list(scores.items()) for qid, scores in results_changed.items()},
+                        'S_base_changed': S_base_changed.cpu().numpy().tolist() if S_base_changed is not None else None,
+                        'S_neg_changed': S_neg_changed.cpu().numpy().tolist() if S_neg_changed is not None else None
                     })
 
                     # 选择最佳参数：综合考虑 p-MRR、og_nDCG 和 changed_nDCG
@@ -611,7 +614,17 @@ class DSCLREvaluatorEngine:
         self._save_all_params_summary(all_results)
 
         # 生成坏例分析报告
-        self._generate_bad_case_analysis(all_query_metrics, q_raw_og, q_raw_changed)
+        # 将 corpus 合并到 candidates 中，方便后续坏例分析使用文档文本
+        candidates_with_text = {}
+        for qid, doc_ids in candidates.items():
+            for doc_id in doc_ids:
+                if doc_id not in candidates_with_text:
+                    candidates_with_text[doc_id] = corpus.get(doc_id, {'text': ''})
+        
+        self._generate_bad_case_analysis(
+            all_query_metrics, q_raw_og, q_raw_changed, 
+            candidates_with_text, all_results
+        )
 
         # 保存 TREC 格式文件
         trec_dir = os.path.join(self.output_dir, "trec")
@@ -640,7 +653,7 @@ class DSCLREvaluatorEngine:
             logger.info(f"💾 MLP 测试结果已保存: {result_path}")
         else:
             # 静态网格搜索模式：保存完整结果
-            self._save_results(all_results, best_params, best_metrics)
+            self._save_results(all_results, best_params, best_metrics, all_query_metrics)
 
         return {
             'best_params': {'alpha': 'dynamic', 'tau': 'dynamic'} if self.use_mlp else {'alpha': best_params[0], 'tau': best_params[1]},
@@ -812,7 +825,8 @@ class DSCLREvaluatorEngine:
         self,
         all_results: List[Dict],
         best_params,
-        best_metrics: Dict
+        best_metrics: Dict,
+        all_query_metrics: Optional[List[Dict]] = None
     ) -> None:
         """保存评测结果"""
         results_path = os.path.join(self.output_dir, "random_search_results.json")
@@ -828,7 +842,8 @@ class DSCLREvaluatorEngine:
             save_data = {
                 'best_params': {'alpha': best_params[0], 'tau': best_params[1]},
                 'best_metrics': best_metrics,
-                'all_results': all_results
+                'all_results': all_results,
+                'all_query_metrics': all_query_metrics or []
             }
         
         with open(results_path, 'w', encoding='utf-8') as f:
@@ -1081,113 +1096,616 @@ class DSCLREvaluatorEngine:
         self,
         all_query_metrics: List[Dict[str, Any]],
         q_raw_og: Dict[str, Tuple[str, str]],
-        q_raw_changed: Dict[str, Tuple[str, str]]
+        q_raw_changed: Dict[str, Tuple[str, str]],
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]]
     ) -> None:
-        """生成坏例分析诊断报告"""
-        # 提取 k=5 时的 p-MRR（使用 MRR 作为代理）
-        og_metrics = [m for m in all_query_metrics if m['query_type'] == 'og' and m['k'] == 5]
+        """生成极端坏例分析诊断报告"""
+        report_path = os.path.join(self.output_dir, "bad_case_analysis.md")
         
-        if not og_metrics:
-            logger.warning("⚠️ 无法生成坏例分析：没有足够的查询指标数据")
-            return
-        
-        mrr_values = [m['mrr'] for m in og_metrics]
-        mean_mrr = np.mean(mrr_values)
-        std_mrr = np.std(mrr_values)
-        
-        # 筛选显著低于平均的样本（低于 mean - std）
-        low_performance = [m for m in og_metrics if m['mrr'] < mean_mrr - std_mrr]
-        # 筛选显著高于平均的样本（高于 mean + std）
-        high_performance = [m for m in og_metrics if m['mrr'] > mean_mrr + std_mrr]
-        
-        # 构建坏例分析报告
-        report = {
-            'statistics': {
-                'total_queries': len(og_metrics),
-                'mean_mrr': float(mean_mrr),
-                'std_mrr': float(std_mrr),
-                'low_performance_count': len(low_performance),
-                'high_performance_count': len(high_performance),
-            },
-            'low_performance_samples': [],
-            'high_performance_samples': [],
-            'comparison_analysis': {}
-        }
-        
-        # 添加低性能样本详情
-        for m in low_performance[:10]:  # 最多10个
-            qid = m['qid']
-            # q_raw_og 的键是完整格式，如 "310-og"
-            og_key = f"{qid}-og"
-            raw = q_raw_og.get(og_key, ("", ""))
-            
-            sample = {
-                'qid': qid,
-                'mrr': float(m['mrr']),
-                'ndcg': float(m['ndcg']),
-                'map': float(m['map']),
-                'query': raw[0] if raw else "",
-                'instruction': raw[1] if raw else "",
-            }
-            report['low_performance_samples'].append(sample)
-        
-        # 添加高性能样本详情
-        for m in high_performance[:10]:  # 最多10个
-            qid = m['qid']
-            # q_raw_og 的键是完整格式，如 "310-og"
-            og_key = f"{qid}-og"
-            raw = q_raw_og.get(og_key, ("", ""))
-            
-            sample = {
-                'qid': qid,
-                'mrr': float(m['mrr']),
-                'ndcg': float(m['ndcg']),
-                'map': float(m['map']),
-                'query': raw[0] if raw else "",
-                'instruction': raw[1] if raw else "",
-            }
-            report['high_performance_samples'].append(sample)
-        
-        # 对比分析
-        low_query_lens = [len(s['query'].split()) for s in report['low_performance_samples']]
-        high_query_lens = [len(s['query'].split()) for s in report['high_performance_samples']]
-        
-        low_instr_lens = [len(s['instruction'].split()) for s in report['low_performance_samples']]
-        high_instr_lens = [len(s['instruction'].split()) for s in report['high_performance_samples']]
-        
-        report['comparison_analysis'] = {
-            'avg_query_length_low': float(np.mean(low_query_lens)) if low_query_lens else 0,
-            'avg_query_length_high': float(np.mean(high_query_lens)) if high_query_lens else 0,
-            'avg_instruction_length_low': float(np.mean(low_instr_lens)) if low_instr_lens else 0,
-            'avg_instruction_length_high': float(np.mean(high_instr_lens)) if high_instr_lens else 0,
-            'key_findings': []
-        }
-        
-        # 自动生成分析结论
-        if report['comparison_analysis']['avg_query_length_high'] > report['comparison_analysis']['avg_query_length_low']:
-            report['comparison_analysis']['key_findings'].append(
-                "高性能样本倾向于有更长的查询文本"
-            )
-        else:
-            report['comparison_analysis']['key_findings'].append(
-                "低性能样本倾向于有更长的查询文本"
-            )
-        
-        if report['comparison_analysis']['avg_instruction_length_high'] > report['comparison_analysis']['avg_instruction_length_low']:
-            report['comparison_analysis']['key_findings'].append(
-                "高性能样本倾向于有更长的指令文本"
-            )
-        else:
-            report['comparison_analysis']['key_findings'].append(
-                "低性能样本倾向于有更长的指令文本"
-            )
-        
-        # 保存报告
-        report_path = os.path.join(self.output_dir, "bad_case_analysis.json")
         with open(report_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            f.write("# 🔍 DSCLR 极端坏例分析报告\n\n")
+            f.write(f"**生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("---\n\n")
+            
+            report_data = self._analyze_extreme_cases(
+                all_query_metrics, q_raw_og, q_raw_changed, 
+                candidates, all_results
+            )
+            
+            f.write(report_data['markdown'])
+        
+        json_report_path = os.path.join(self.output_dir, "bad_case_analysis.json")
+        with open(json_report_path, 'w', encoding='utf-8') as json_f:
+            json.dump(report_data['json'], json_f, indent=2, ensure_ascii=False)
         
         logger.info(f"💾 坏例分析报告已保存: {report_path}")
+        logger.info(f"💾 JSON格式报告已保存: {json_report_path}")
+    
+    def _analyze_extreme_cases(
+        self,
+        all_query_metrics: List[Dict[str, Any]],
+        q_raw_og: Dict[str, Tuple[str, str]],
+        q_raw_changed: Dict[str, Tuple[str, str]],
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """分析极端坏例"""
+        
+        result_params = {r['alpha']: r['tau'] for r in all_results}
+        
+        alpha_0_result = next((r for r in all_results if r['alpha'] == 0.0), None)
+        alpha_5_tau_7_result = next((r for r in all_results if r['alpha'] == 5.0 and abs(r['tau'] - 0.7) < 0.01), None)
+        alpha_1_tau_8_result = next((r for r in all_results if r['alpha'] == 1.0 and abs(r['tau'] - 0.8) < 0.01), None)
+        
+        if not alpha_0_result:
+            return {'markdown': '# ❌ 错误：未找到 α=0.0 的结果\n', 'json': {'error': 'Missing alpha=0.0 results'}}
+        
+        og_metrics = [m for m in all_query_metrics if m['query_type'] == 'og' and m['k'] == 5]
+        
+        query_neg_scores = self._compute_query_negative_scores(
+            q_raw_changed, candidates, all_results
+        )
+        
+        selected_queries = self._select_extreme_queries(
+            og_metrics, query_neg_scores, q_raw_og, q_raw_changed
+        )
+        
+        markdown_output = self._generate_query_analysis_markdown(
+            selected_queries, candidates, all_results,
+            alpha_0_result, alpha_5_tau_7_result, alpha_1_tau_8_result,
+            q_raw_changed, query_neg_scores
+        )
+        
+        json_output = self._generate_query_analysis_json(
+            selected_queries, candidates, all_results,
+            alpha_0_result, alpha_5_tau_7_result, alpha_1_tau_8_result,
+            q_raw_changed, query_neg_scores
+        )
+        
+        return {'markdown': markdown_output, 'json': json_output}
+    
+    def _compute_query_negative_scores(
+        self,
+        q_raw_changed: Dict[str, Tuple[str, str]],
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]]
+    ) -> Dict[str, Dict[str, float]]:
+        """计算每个Query的正负向得分"""
+        
+        alpha_0_result = next((r for r in all_results if r['alpha'] == 0.0), None)
+        
+        if not alpha_0_result:
+            return {}
+        
+        query_neg_scores = {}
+        
+        for qid in [k.split('-')[0] for k in q_raw_changed.keys()]:
+            changed_key = f"{qid}-changed"
+            
+            if changed_key not in q_raw_changed:
+                continue
+            
+            query, negative_words = q_raw_changed[changed_key]
+            
+            if not negative_words:
+                query_neg_scores[qid] = {'pos_score': 0.0, 'neg_scores': []}
+                continue
+            
+            neg_words_list = [w.strip() for w in negative_words.split(',')]
+            
+            query_neg_scores[qid] = {
+                'neg_words': neg_words_list,
+                'doc_scores': {}
+            }
+            
+            results_changed = alpha_0_result.get('results_changed', {})
+            
+            changed_key = f"{qid}-changed"
+            if changed_key in results_changed:
+                for doc_id, score in results_changed[changed_key][:50]:
+                    doc = candidates.get(doc_id, {})
+                    doc_text = doc.get('text', '') if isinstance(doc, dict) else str(doc)
+                    
+                    neg_word_found = None
+                    for neg_word in neg_words_list:
+                        if neg_word.lower() in doc_text.lower():
+                            neg_word_found = neg_word
+                            break
+                    
+                    if neg_word_found:
+                        query_neg_scores[qid]['doc_scores'][doc_id] = {
+                            'score': score,
+                            'neg_word': neg_word_found,
+                            'text_snippet': doc_text[:200]
+                        }
+        
+        return query_neg_scores
+    
+    def _select_extreme_queries(
+        self,
+        og_metrics: List[Dict[str, Any]],
+        query_neg_scores: Dict[str, Dict[str, float]],
+        q_raw_og: Dict[str, Tuple[str, str]],
+        q_raw_changed: Dict[str, Tuple[str, Tuple[str, str]]]
+    ) -> List[Dict[str, Any]]:
+        """选择4种极端类型的Query"""
+        
+        query_type_scores = {}
+        for m in og_metrics:
+            qid = str(m['qid'])
+            mrr = m['mrr']
+            
+            neg_info = query_neg_scores.get(qid, {})
+            avg_neg_score = 0.0
+            
+            if neg_info.get('doc_scores'):
+                scores = [d['score'] for d in neg_info['doc_scores'].values()]
+                avg_neg_score = np.mean(scores) if scores else 0.0
+            
+            query_type_scores[qid] = {
+                'mrr': mrr,
+                'avg_neg_score': avg_neg_score,
+                'neg_info': neg_info
+            }
+        
+        high_noise = []
+        low_noise = []
+        entity_entangled = []
+        logical_negation = []
+        
+        for qid, scores in query_type_scores.items():
+            avg_neg = scores['avg_neg_score']
+            
+            neg_info = scores.get('neg_info', {})
+            neg_words = neg_info.get('neg_words', [])
+            
+            has_entity_neg = any(
+                any(c.isalpha() and len(c) > 3 for c in w.split()) 
+                for w in neg_words
+            )
+            
+            is_logical_only = all(
+                any(neg in w.lower() for neg in ['not', 'no', 'without', 'except', '除了', '不要', '非', '无'])
+                for w in neg_words
+            ) if neg_words else True
+            
+            if avg_neg > 0.65:
+                high_noise.append((qid, scores, 'high_noise'))
+            elif avg_neg < 0.55 and avg_neg > 0:
+                low_noise.append((qid, scores, 'low_noise'))
+            
+            if is_logical_only and neg_words:
+                logical_negation.append((qid, scores, 'logical_negation'))
+        
+        entity_keywords = ['病', '癌', '基因', '细胞', '蛋白', '病毒', '遗传', '突', '转基因', 
+                          'cancer', 'gene', 'protein', 'virus', 'genetic', 'mutant']
+        
+        for qid, scores in query_type_scores.items():
+            og_key = f"{qid}-og"
+            raw = q_raw_og.get(og_key, ("", ""))
+            query_text = raw[0].lower() if raw else ""
+            
+            has_entity = any(kw in query_text for kw in entity_keywords)
+            
+            if has_entity:
+                neg_info = scores.get('neg_info', {})
+                if neg_info.get('neg_words'):
+                    entity_entangled.append((qid, scores, 'entity_entangled'))
+        
+        selected = []
+        
+        if high_noise:
+            selected.append(high_noise[0])
+        if low_noise:
+            selected.append(low_noise[0])
+        if entity_entangled:
+            selected.append(entity_entangled[0])
+        if logical_negation:
+            selected.append(logical_negation[0])
+        
+        remaining = []
+        for qid, scores, qtype in high_noise[1:]:
+            if qid not in [s[0] for s in selected]:
+                remaining.append((qid, scores, qtype))
+        for qid, scores, qtype in low_noise[1:]:
+            if qid not in [s[0] for s in selected]:
+                remaining.append((qid, scores, qtype))
+        for qid, scores, qtype in entity_entangled[1:]:
+            if qid not in [s[0] for s in selected]:
+                remaining.append((qid, scores, qtype))
+        for qid, scores, qtype in logical_negation[1:]:
+            if qid not in [s[0] for s in selected]:
+                remaining.append((qid, scores, qtype))
+        
+        selected.extend(remaining[:max(0, 8 - len(selected))])
+        
+        return selected
+    
+    def _generate_query_analysis_markdown(
+        self,
+        selected_queries: List[Tuple],
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]],
+        alpha_0_result: Optional[Dict],
+        alpha_5_tau_7_result: Optional[Dict],
+        alpha_1_tau_8_result: Optional[Dict],
+        q_raw_changed: Dict[str, Tuple[str, str]],
+        query_neg_scores: Dict[str, Dict]
+    ) -> str:
+        """生成Markdown格式的分析报告"""
+        
+        markdown = "## 📋 选中的极端Query分析\n\n"
+        
+        type_names = {
+            'high_noise': '🔴 高底噪型',
+            'low_noise': '🟢 低底噪型',
+            'entity_entangled': '🟠 实体纠缠型',
+            'logical_negation': '🔵 纯逻辑否定型'
+        }
+        
+        for qid, scores, qtype in selected_queries:
+            changed_key = f"{qid}-changed"
+            raw = q_raw_changed.get(changed_key, ("", ""))
+            query_text, neg_words = raw
+            
+            neg_info = query_neg_scores.get(qid, {})
+            
+            markdown += f"### {type_names.get(qtype, qtype)} - Q{qid}\n\n"
+            markdown += f"**Query**: {query_text}\n\n"
+            markdown += f"**负向词**: {neg_words}\n\n"
+            markdown += f"**当前MRR**: {scores['mrr']:.4f}\n\n"
+            markdown += f"**平均负向得分**: {scores['avg_neg_score']:.4f}\n\n"
+            
+            markdown += f"---\n\n"
+            markdown += f"#### 【数据组 A：假阳性（漏网的烂文）】 α=0.0\n\n"
+            
+            fp_docs = self._extract_false_positives(
+                qid, candidates, alpha_0_result, neg_info
+            )
+            
+            for i, doc in enumerate(fp_docs[:3], 1):
+                markdown += f"**A-{i}**: `doc_id={doc['doc_id']}`\n"
+                markdown += f"- Snippet: {doc['snippet']}\n"
+                markdown += f"- $S_{{pos}}$: {doc['S_pos']:.4f}, $S_{{neg\_proj}}$: {doc['S_neg_proj']:.4f}\n\n"
+            
+            markdown += f"---\n\n"
+            markdown += f"#### 【数据组 B：假阴性（冤死的极品好文）】 α=5.0, τ=0.7\n\n"
+            
+            fn_docs = self._extract_false_negatives(
+                qid, candidates, all_results, neg_info
+            )
+            
+            for i, doc in enumerate(fn_docs[:3], 1):
+                markdown += f"**B-{i}**: `doc_id={doc['doc_id']}`\n"
+                markdown += f"- Snippet: {doc['snippet']}\n"
+                markdown += f"- $S_{{pos}}$: {doc['S_pos']:.4f}, $S_{{neg\_proj}}$: {doc['S_neg_proj']:.4f}\n"
+                markdown += f"- Penalty: {doc['penalty']:.4f}\n"
+                markdown += f"- 原排名: {doc['original_rank']}, 现排名: {doc['current_rank']}\n\n"
+            
+            markdown += f"---\n\n"
+            markdown += f"#### 【数据组 C：当前最优参数下的残留误差】 α=1.0, τ=0.8\n\n"
+            
+            if alpha_1_tau_8_result:
+                c_docs = self._extract_optimal_residual_errors(
+                    qid, candidates, alpha_1_tau_8_result, all_results
+                )
+                
+                if c_docs['false_positive']:
+                    doc = c_docs['false_positive']
+                    markdown += f"**C-1 漏网烂文**: `doc_id={doc['doc_id']}`\n"
+                    markdown += f"- $S_{{pos}}$: {doc['S_pos']:.4f}, $S_{{neg\_proj}}$: {doc['S_neg_proj']:.4f}\n"
+                    markdown += f"- 排名: {doc['rank']}\n\n"
+                
+                if c_docs['false_negative']:
+                    doc = c_docs['false_negative']
+                    markdown += f"**C-2 冤枉好文**: `doc_id={doc['doc_id']}`\n"
+                    markdown += f"- $S_{{pos}}$: {doc['S_pos']:.4f}, $S_{{neg\_proj}}$: {doc['S_neg_proj']:.4f}\n"
+                    markdown += f"- 排名: {doc['rank']}\n\n"
+            
+            markdown += f"---\n\n"
+            markdown += f"#### 【数据组 D：特征倒挂点】❗最高优先级\n\n"
+            
+            inversion = self._extract_feature_inversions(
+                qid, candidates, all_results, neg_info
+            )
+            
+            if inversion:
+                markdown += f"**倒挂文档对**:\n\n"
+                markdown += f"- **好文** (相关): `doc_id={inversion['good']['doc_id']}`\n"
+                markdown += f"  - Snippet: {inversion['good']['snippet']}\n"
+                markdown += f"  - $S_{{neg\_proj}}$: {inversion['good']['S_neg_proj']:.4f}\n\n"
+                markdown += f"- **烂文** (不相关): `doc_id={inversion['bad']['doc_id']}`\n"
+                markdown += f"  - Snippet: {inversion['bad']['snippet']}\n"
+                markdown += f"  - $S_{{neg\_proj}}$: {inversion['bad']['S_neg_proj']:.4f}\n\n"
+                markdown += f"- **差值**: {inversion['diff']:.4f}\n\n"
+            else:
+                markdown += f"未找到特征倒挂点\n\n"
+            
+            markdown += "---\n\n"
+        
+        return markdown
+    
+    def _generate_query_analysis_json(
+        self,
+        selected_queries: List[Tuple],
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]],
+        alpha_0_result: Optional[Dict],
+        alpha_5_tau_7_result: Optional[Dict],
+        alpha_1_tau_8_result: Optional[Dict],
+        q_raw_changed: Dict[str, Tuple[str, str]],
+        query_neg_scores: Dict[str, Dict]
+    ) -> Dict[str, Any]:
+        """生成JSON格式的分析报告"""
+        
+        json_output = {
+            'statistics': {
+                'total_selected_queries': len(selected_queries)
+            },
+            'queries': []
+        }
+        
+        type_names = {
+            'high_noise': '高底噪型',
+            'low_noise': '低底噪型',
+            'entity_entangled': '实体纠缠型',
+            'logical_negation': '纯逻辑否定型'
+        }
+        
+        for qid, scores, qtype in selected_queries:
+            changed_key = f"{qid}-changed"
+            raw = q_raw_changed.get(changed_key, ("", ""))
+            query_text, neg_words = raw
+            
+            neg_info = query_neg_scores.get(qid, {})
+            
+            query_data = {
+                'qid': qid,
+                'type': type_names.get(qtype, qtype),
+                'query': query_text,
+                'negative_words': neg_words,
+                'current_mrr': float(scores['mrr']),
+                'avg_neg_score': float(scores['avg_neg_score']),
+                'data_group_A': [],
+                'data_group_B': [],
+                'data_group_C': {},
+                'data_group_D': None
+            }
+            
+            fp_docs = self._extract_false_positives(
+                qid, candidates, alpha_0_result, neg_info
+            )
+            query_data['data_group_A'] = fp_docs[:3]
+            
+            fn_docs = self._extract_false_negatives(
+                qid, candidates, all_results, neg_info
+            )
+            query_data['data_group_B'] = fn_docs[:3]
+            
+            if alpha_1_tau_8_result:
+                c_docs = self._extract_optimal_residual_errors(
+                    qid, candidates, alpha_1_tau_8_result, all_results
+                )
+                query_data['data_group_C'] = c_docs
+            
+            inversion = self._extract_feature_inversions(
+                qid, candidates, all_results, neg_info
+            )
+            query_data['data_group_D'] = inversion
+            
+            json_output['queries'].append(query_data)
+        
+        return json_output
+    
+    def _extract_false_positives(
+        self,
+        qid: str,
+        candidates: Dict[str, Any],
+        alpha_0_result: Optional[Dict],
+        neg_info: Dict
+    ) -> List[Dict[str, Any]]:
+        """提取假阳性文档（数据组A）"""
+        
+        if not alpha_0_result:
+            return []
+        
+        results_changed = alpha_0_result.get('results_changed', {})
+        
+        changed_key = f"{qid}-changed"
+        if changed_key not in results_changed:
+            return []
+        
+        fp_docs = []
+        
+        for doc_id, score in results_changed[changed_key][:10]:
+            doc = candidates.get(doc_id, {})
+            doc_text = doc.get('text', '') if isinstance(doc, dict) else str(doc)
+            
+            neg_words = neg_info.get('neg_words', [])
+            neg_word_found = None
+            
+            for neg_word in neg_words:
+                if neg_word.lower() in doc_text.lower():
+                    neg_word_found = neg_word
+                    break
+            
+            if neg_word_found and neg_word_found in neg_info.get('doc_scores', {}):
+                doc_score_info = neg_info['doc_scores'][doc_id]
+                
+                fp_docs.append({
+                    'doc_id': doc_id,
+                    'snippet': doc_text[:150],
+                    'S_pos': float(score),
+                    'S_neg_proj': float(doc_score_info['score']),
+                    'neg_word': neg_word_found
+                })
+        
+        return fp_docs
+    
+    def _extract_false_negatives(
+        self,
+        qid: str,
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]],
+        neg_info: Dict
+    ) -> List[Dict[str, Any]]:
+        """提取假阴性文档（数据组B）"""
+        
+        alpha_0_result = next((r for r in all_results if r['alpha'] == 0.0), None)
+        alpha_5_result = next((r for r in all_results if r['alpha'] == 5.0 and abs(r['tau'] - 0.7) < 0.01), None)
+        
+        if not alpha_0_result or not alpha_5_result:
+            return []
+        
+        results_0 = alpha_0_result.get('results_changed', {}).get(f"{qid}-changed", [])
+        results_5 = alpha_5_result.get('results_changed', {}).get(f"{qid}-changed", [])
+        
+        fn_docs = []
+        
+        for i, (doc_id, score_0) in enumerate(results_0[:10]):
+            rank_0 = i + 1
+            
+            rank_5 = None
+            score_5 = None
+            for j, (d_id, s) in enumerate(results_5):
+                if d_id == doc_id:
+                    rank_5 = j + 1
+                    score_5 = s
+                    break
+            
+            if rank_5 and rank_5 > 50:
+                doc = candidates.get(doc_id, {})
+                doc_text = doc.get('text', '') if isinstance(doc, dict) else str(doc)
+                
+                neg_word = neg_info.get('doc_scores', {}).get(doc_id, {}).get('neg_word', '')
+                
+                penalty = abs(score_0 - score_5) if score_5 else 0
+                
+                fn_docs.append({
+                    'doc_id': doc_id,
+                    'snippet': doc_text[:150],
+                    'S_pos': float(score_0),
+                    'S_neg_proj': float(score_5),
+                    'penalty': float(penalty),
+                    'original_rank': rank_0,
+                    'current_rank': rank_5
+                })
+        
+        return fn_docs
+    
+    def _extract_optimal_residual_errors(
+        self,
+        qid: str,
+        candidates: Dict[str, Any],
+        alpha_1_tau_8_result: Dict,
+        all_results: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """提取最优参数下的残留误差（数据组C）"""
+        
+        alpha_0_result = next((r for r in all_results if r['alpha'] == 0.0), None)
+        
+        if not alpha_0_result:
+            return {}
+        
+        results_optimal = alpha_1_tau_8_result.get('results_changed', {}).get(f"{qid}-changed", [])
+        results_0 = alpha_0_result.get('results_changed', {}).get(f"{qid}-changed", [])
+        
+        best_fp = None
+        worst_fn = None
+        
+        for i, (doc_id, score) in enumerate(results_optimal[:20]):
+            if doc_id in results_0:
+                rank_0 = next((j for j, (d, _) in enumerate(results_0) if d == doc_id), None)
+                
+                if rank_0 is not None and rank_0 < 10:
+                    doc = candidates.get(doc_id, {})
+                    doc_text = doc.get('text', '') if isinstance(doc, dict) else str(doc)
+                    
+                    best_fp = {
+                        'doc_id': doc_id,
+                        'S_pos': float(score),
+                        'S_neg_proj': 0.0,
+                        'rank': i + 1
+                    }
+                    break
+        
+        for i, (doc_id, score) in enumerate(results_optimal):
+            if doc_id in results_0:
+                rank_0 = next((j for j, (d, _) in enumerate(results_0) if d == doc_id), None)
+                
+                if rank_0 is not None and rank_0 < 10:
+                    if worst_fn is None or i > worst_fn.get('rank', 0):
+                        worst_fn = {
+                            'doc_id': doc_id,
+                            'S_pos': float(score),
+                            'S_neg_proj': 0.0,
+                            'rank': i + 1
+                        }
+        
+        return {
+            'false_positive': best_fp,
+            'false_negative': worst_fn
+        }
+    
+    def _extract_feature_inversions(
+        self,
+        qid: str,
+        candidates: Dict[str, Any],
+        all_results: List[Dict[str, Any]],
+        neg_info: Dict
+    ) -> Optional[Dict[str, Any]]:
+        """提取特征倒挂点（数据组D）"""
+        
+        alpha_0_result = next((r for r in all_results if r['alpha'] == 0.0), None)
+        
+        if not alpha_0_result:
+            return None
+        
+        results_changed = alpha_0_result.get('results_changed', {}).get(f"{qid}-changed", [])
+        
+        doc_neg_scores = neg_info.get('doc_scores', {})
+        
+        relevant_docs = []
+        irrelevant_docs = []
+        
+        for doc_id, score in results_changed:
+            if doc_id in doc_neg_scores:
+                doc_score_info = doc_neg_scores[doc_id]
+                
+                relevant_docs.append({
+                    'doc_id': doc_id,
+                    'S_neg_proj': doc_score_info['score']
+                })
+        
+        for doc_id, score in results_changed[:100]:
+            if doc_id not in doc_neg_scores:
+                doc = candidates.get(doc_id, {})
+                doc_text = doc.get('text', '') if isinstance(doc, dict) else str(doc)
+                
+                irrelevant_docs.append({
+                    'doc_id': doc_id,
+                    'S_neg_proj': 0.0,
+                    'snippet': doc_text[:150]
+                })
+        
+        if not relevant_docs or not irrelevant_docs:
+            return None
+        
+        relevant_docs_sorted = sorted(relevant_docs, key=lambda x: x['S_neg_proj'], reverse=True)
+        
+        for rel_doc in relevant_docs_sorted[:10]:
+            rel_doc['snippet'] = candidates.get(rel_doc['doc_id'], {}).get('text', '')[:150] if isinstance(candidates.get(rel_doc['doc_id'], {}), dict) else str(candidates.get(rel_doc['doc_id'], ''))[:150]
+            
+            for irr_doc in irrelevant_docs[:20]:
+                if rel_doc['S_neg_proj'] > irr_doc['S_neg_proj']:
+                    return {
+                        'good': rel_doc,
+                        'bad': irr_doc,
+                        'diff': float(rel_doc['S_neg_proj'] - irr_doc['S_neg_proj'])
+                    }
+        
+        return None
 
 
 def run_dsclr_evaluation(
