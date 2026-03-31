@@ -333,6 +333,10 @@ class DSCLREvaluatorEngine:
         # 初始化 MLP (用于动态推理)
         self.mlp = None
         self.use_mlp = False
+        
+        # 初始化 LAP (用于 DeIR 模式)
+        self.lap = None
+        self.use_lap = False
 
         logger.info(f"✅ DSCLR 评测引擎初始化完成")
         logger.info(f"   模型: {self.model_name}")
@@ -380,12 +384,13 @@ class DSCLREvaluatorEngine:
 
         return S_final, alpha, tau
 
-    def run(self, mlp_model_path: Optional[str] = None, mlp_hidden_dim: int = 256) -> Dict[str, Any]:
-        """运行 DSCLR 评测流程（含网格搜索或动态 MLP）
+    def run(self, mlp_model_path: Optional[str] = None, mlp_hidden_dim: int = 256, lap_model_path: Optional[str] = None) -> Dict[str, Any]:
+        """运行 DSCLR 评测流程（含网格搜索、动态 MLP 或 DeIR 模式）
         
         Args:
             mlp_model_path: 如果提供，则使用动态 MLP 推理；否则使用网格搜索
             mlp_hidden_dim: MLP隐藏层维度 (默认: 256)
+            lap_model_path: 如果提供，则使用 LAP 投影负向查询（DeIR 模式）
         """
         logger.info("=" * 60)
         logger.info("🚀 开始 DSCLR 评测")
@@ -393,28 +398,60 @@ class DSCLREvaluatorEngine:
 
         start_time = time.time()
 
+        # 根据模型名称确定嵌入维度
+        if "mistral" in self.model_name.lower() or "repllama" in self.model_name.lower():
+            embed_dim = 4096
+            logger.info(f"   检测到 {self.model_name} 模型，使用嵌入维度: {embed_dim}")
+        else:
+            embed_dim = 1024
+            logger.info(f"   使用默认嵌入维度: {embed_dim}")
+
+        # 初始化 LAP (如果提供了模型路径)
+        if lap_model_path:
+            logger.info(f"🧠 加载 LAP 模型: {lap_model_path}")
+            from model.lap_module import LAPProjection
+            
+            self.lap = LAPProjection(hidden_dim=embed_dim).to(self.device)
+            lap_checkpoint = torch.load(lap_model_path, map_location=self.device)
+            # 兼容不同的 checkpoint 格式
+            if 'lap_state_dict' in lap_checkpoint:
+                self.lap.load_state_dict(lap_checkpoint['lap_state_dict'])
+            else:
+                self.lap.load_state_dict(lap_checkpoint)
+            self.lap.eval()
+            self.use_lap = True
+            logger.info(f"✅ LAP 模型加载成功")
+        else:
+            self.use_lap = False
+
         # 初始化 MLP (如果提供了模型路径)
         if mlp_model_path:
             logger.info(f"🧠 加载动态 MLP 模型: {mlp_model_path}")
             from model.dsclr_mlp import DSCLR_MLP
             
-            # 根据模型名称确定嵌入维度
-            if "mistral" in self.model_name.lower() or "repllama" in self.model_name.lower():
-                embed_dim = 4096
-                logger.info(f"   检测到 {self.model_name} 模型，使用嵌入维度: {embed_dim}")
-            else:
-                embed_dim = 1024
-                logger.info(f"   使用默认嵌入维度: {embed_dim}")
-            
             # 使用指定的 hidden_dim
             self.mlp = DSCLR_MLP(input_dim=embed_dim, hidden_dim=mlp_hidden_dim).to(self.device)
-            self.mlp.load_state_dict(torch.load(mlp_model_path, map_location=self.device))
+            mlp_checkpoint = torch.load(mlp_model_path, map_location=self.device)
+            # 兼容不同的 checkpoint 格式
+            if 'mlp_state_dict' in mlp_checkpoint:
+                self.mlp.load_state_dict(mlp_checkpoint['mlp_state_dict'])
+            else:
+                self.mlp.load_state_dict(mlp_checkpoint)
             self.mlp.eval()
             self.use_mlp = True
             logger.info(f"✅ MLP 模型加载成功 (hidden_dim={mlp_hidden_dim})，进入动态推理模式")
         else:
             self.use_mlp = False
-            logger.info("🔬 使用静态网格搜索模式")
+        
+        # 输出当前模式
+        if self.use_lap and self.use_mlp:
+            logger.info("🔬 进入 DeIR 模式 (LAP + MLP)")
+        elif self.use_mlp:
+            logger.info("🔬 进入 DSCLR+MLP 动态模式")
+        elif self.use_lap:
+            logger.info("🔬 进入 DSCLR+LAP 模式 (使用 LAP 投影 + 网格搜索)")
+        else:
+            logger.info("🔬 进入 DSCLR 基础模式 (网格搜索)")
 
         # 加载数据
         corpus, q_og, q_changed, candidates = self.data_loader.load()
@@ -481,6 +518,15 @@ class DSCLREvaluatorEngine:
         # S_neg: 使用 Q- (负查询)
         logger.info("📊 计算 changed 得分矩阵 (S_base=原查询, S_neg=Q-)...")
         S_base_changed = self.retriever.compute_base_scores(q_original_embeddings_changed)
+        
+        # 【LAP 投影】如果使用 LAP，对负向查询向量进行投影
+        if self.use_lap:
+            logger.info("🔄 使用 LAP 投影负向查询...")
+            with torch.no_grad():
+                if q_minus_embeddings_changed.device != self.device:
+                    q_minus_embeddings_changed = q_minus_embeddings_changed.to(self.device)
+                q_minus_embeddings_changed = self.lap(q_minus_embeddings_changed)
+        
         q_minus_embeddings_changed = q_minus_embeddings_changed.to(self.retriever.doc_embeddings.device)
         S_neg_changed = torch.matmul(q_minus_embeddings_changed, self.retriever.doc_embeddings.T)
         S_neg_changed = S_neg_changed * neg_mask_changed.unsqueeze(1)
@@ -1760,11 +1806,19 @@ def run_dsclr_evaluation(
     use_cache: bool = True,
     mlp_model_path: Optional[str] = None,
     mlp_hidden_dim: int = 256,
+    lap_model_path: Optional[str] = None,
     alphas: Optional[str] = None,
     taus: Optional[str] = None,
     num_samples: int = 15
 ) -> Dict[str, Any]:
-    """运行 DSCLR 评测的便捷函数"""
+    """运行 DSCLR 评测的便捷函数
+    
+    支持四种模式：
+    1. DSCLR 基础模式：不提供 mlp_model_path 和 lap_model_path
+    2. DSCLR+MLP 模式：只提供 mlp_model_path
+    3. DSCLR+LAP 模式：只提供 lap_model_path
+    4. DeIR 模式（LAP+MLP）：同时提供 lap_model_path 和 mlp_model_path
+    """
     engine = DSCLREvaluatorEngine(
         model_name=model_name,
         task_name=task_name,
@@ -1777,7 +1831,7 @@ def run_dsclr_evaluation(
         taus=taus,
         num_samples=num_samples
     )
-    return engine.run(mlp_model_path=mlp_model_path, mlp_hidden_dim=mlp_hidden_dim)
+    return engine.run(mlp_model_path=mlp_model_path, mlp_hidden_dim=mlp_hidden_dim, lap_model_path=lap_model_path)
 
 
 if __name__ == "__main__":
@@ -1793,6 +1847,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_cache", type=bool, default=True, help="是否使用缓存")
     parser.add_argument("--mlp_model_path", type=str, default=None, help="MLP模型路径 (可选，使用动态MLP推理)")
     parser.add_argument("--mlp_hidden_dim", type=int, default=256, help="MLP隐藏层维度 (默认: 256)")
+    parser.add_argument("--lap_model_path", type=str, default=None, help="LAP模型路径 (可选，使用LAP投影负向查询)")
     parser.add_argument("--alphas", type=str, default=None, help="Alpha 搜索范围，逗号分隔 (默认: 0.0,0.5,1.0,2.0,3.0,5.0)")
     parser.add_argument("--taus", type=str, default=None, help="Tau 搜索范围，逗号分隔 (默认: 0.5,0.6,0.7,0.8,0.9,0.95)")
     parser.add_argument("--num_samples", type=int, default=15, help="随机抽样数量 (默认: 15)")
@@ -1814,6 +1869,7 @@ if __name__ == "__main__":
         use_cache=args.use_cache,
         mlp_model_path=args.mlp_model_path,
         mlp_hidden_dim=args.mlp_hidden_dim,
+        lap_model_path=args.lap_model_path,
         alphas=args.alphas,
         taus=args.taus,
         num_samples=args.num_samples
