@@ -24,6 +24,25 @@ echo "✅ 已激活环境: $CONDA_DEFAULT_ENV"
 echo "✅ Python 路径: $(which python)"
 
 # ============================================================
+# 运行模式配置: "base", "mlp", "lap", "deir"
+#   base - DSCLR 基础模式（网格搜索）
+#   mlp  - DSCLR+MLP 模式（MLP 动态预测 alpha/tau）
+#   lap  - DSCLR+LAP 模式（LAP 投影 + 网格搜索）
+#   deir - DeIR 模式（LAP + MLP）
+# ============================================================
+RUN_MODE="base"  # 修改这里切换模式
+
+# ============================================================
+# 模型路径配置（根据 RUN_MODE 设置）
+# ============================================================
+# LAP 模型路径（RUN_MODE="lap" 或 "deir" 时需要）
+LAP_MODEL_PATH=""
+# MLP 模型路径（RUN_MODE="mlp" 或 "deir" 时需要）
+MLP_MODEL_PATH=""
+# MLP 隐藏层维度
+MLP_HIDDEN_DIM=256
+
+# ============================================================
 # 编码器类型配置: "bge", "mistral" 或 "repllama"
 # ============================================================
 ENCODER_TYPE="repllama"  # 修改这里切换模型
@@ -203,6 +222,31 @@ if [[ ! " ${VALID_TASKS[@]} " =~ " ${TASK} " ]]; then
     exit 1
 fi
 
+# 校验运行模式
+VALID_MODES=("base" "mlp" "lap" "deir")
+if [[ ! " ${VALID_MODES[@]} " =~ " ${RUN_MODE} " ]]; then
+    echo "❌ 错误: 无效运行模式 '$RUN_MODE'"
+    echo "可用模式: ${VALID_MODES[@]}"
+    exit 1
+fi
+
+# 根据模式检查模型路径
+if [ "$RUN_MODE" = "lap" ] || [ "$RUN_MODE" = "deir" ]; then
+    if [ -z "$LAP_MODEL_PATH" ] || [ ! -f "$LAP_MODEL_PATH" ]; then
+        echo "❌ 错误: RUN_MODE='$RUN_MODE' 需要提供有效的 LAP_MODEL_PATH"
+        echo "当前路径: $LAP_MODEL_PATH"
+        exit 1
+    fi
+fi
+
+if [ "$RUN_MODE" = "mlp" ] || [ "$RUN_MODE" = "deir" ]; then
+    if [ -z "$MLP_MODEL_PATH" ] || [ ! -f "$MLP_MODEL_PATH" ]; then
+        echo "❌ 错误: RUN_MODE='$RUN_MODE' 需要提供有效的 MLP_MODEL_PATH"
+        echo "当前路径: $MLP_MODEL_PATH"
+        exit 1
+    fi
+fi
+
 # 如果设置了自定义输出路径，则使用它
 if [ -n "$CUSTOM_OUTPUT_DIR" ]; then
     OUTPUT_DIR="$CUSTOM_OUTPUT_DIR"
@@ -218,16 +262,27 @@ mkdir -p "${OUTPUT_DIR}"
 CONFIG_FILE="${OUTPUT_DIR}/experiment_config.txt"
 cat > "${CONFIG_FILE}" << EOF
 ============================================================
-DSCLR 网格搜索实验配置
+DSCLR 实验配置
 ============================================================
 
 实验时间: $(date '+%Y-%m-%d %H:%M:%S')
 输出目录: ${OUTPUT_DIR}
 
+运行模式: ${RUN_MODE}
+  base - DSCLR 基础模式（网格搜索）
+  mlp  - DSCLR+MLP 模式（MLP 动态预测）
+  lap  - DSCLR+LAP 模式（LAP 投影 + 网格搜索）
+  deir - DeIR 模式（LAP + MLP）
+
 编码器配置:
   ENCODER_TYPE: ${ENCODER_TYPE}
   MODEL_NAME: ${MODEL_NAME}
   EMBED_DIM: ${EMBED_DIM}
+
+模型路径:
+  LAP_MODEL_PATH: ${LAP_MODEL_PATH:-未使用}
+  MLP_MODEL_PATH: ${MLP_MODEL_PATH:-未使用}
+  MLP_HIDDEN_DIM: ${MLP_HIDDEN_DIM}
 
 网格搜索参数:
   ALPHAS: ${ALPHAS}
@@ -242,20 +297,6 @@ DSCLR 网格搜索实验配置
 
 实验备注:
   ${EXPERIMENT_NOTE:-无}
-
-复现命令:
-  cd /home/luwa/Documents/DSCLR
-  bash eval/shells/run_grid_search_dscrl.sh \\
-    --encoder ${ENCODER_TYPE} \\
-    --task ${TASK} \\
-    --gpu ${GPU_ID} \\
-    --batch_size ${BATCH_SIZE} \\
-    --seed ${SEED} \\
-    --alphas "${ALPHAS}" \\
-    --taus "${TAUS}" \\
-    --num_samples ${NUM_SAMPLES} \\
-    --output "${OUTPUT_DIR}" \\
-    ${EXPERIMENT_NOTE:+--note "${EXPERIMENT_NOTE}"}
 EOF
 
 echo "📝 实验配置已保存到: ${CONFIG_FILE}"
@@ -266,13 +307,35 @@ cat "${CONFIG_FILE}"
 # ============================================================
 echo ""
 echo "============================================================"
-echo "开始运行网格搜索实验"
+echo "开始运行 DSCLR 实验 [模式: ${RUN_MODE}]"
 echo "============================================================"
 
 # 记录开始时间
 start_time=$(date +%s)
 
-# 运行网格搜索
+# 根据模式构建参数
+EXTRA_ARGS=""
+if [ "$RUN_MODE" = "lap" ] || [ "$RUN_MODE" = "deir" ]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --lap_model_path ${LAP_MODEL_PATH}"
+fi
+if [ "$RUN_MODE" = "mlp" ] || [ "$RUN_MODE" = "deir" ]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --mlp_model_path ${MLP_MODEL_PATH} --mlp_hidden_dim ${MLP_HIDDEN_DIM}"
+fi
+
+# 运行实验
+echo "运行命令:"
+echo "  CUDA_VISIBLE_DEVICES=${GPU_ID} python -u eval/engine_dscrl.py \\"
+echo "    --model_name ${MODEL_NAME} \\"
+echo "    --task_name ${TASK} \\"
+echo "    --batch_size ${BATCH_SIZE} \\"
+echo "    --alphas ${ALPHAS} \\"
+echo "    --taus ${TAUS} \\"
+echo "    --num_samples ${NUM_SAMPLES} \\"
+echo "    --output_dir ${OUTPUT_DIR} \\"
+if [ -n "$EXTRA_ARGS" ]; then
+    echo "    ${EXTRA_ARGS}"
+fi
+
 CUDA_VISIBLE_DEVICES=${GPU_ID} python -u eval/engine_dscrl.py \
     --model_name ${MODEL_NAME} \
     --task_name ${TASK} \
@@ -280,7 +343,8 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python -u eval/engine_dscrl.py \
     --alphas ${ALPHAS} \
     --taus ${TAUS} \
     --num_samples ${NUM_SAMPLES} \
-    --output_dir ${OUTPUT_DIR}
+    --output_dir ${OUTPUT_DIR} \
+    ${EXTRA_ARGS}
 
 # 记录结束时间
 end_time=$(date +%s)
