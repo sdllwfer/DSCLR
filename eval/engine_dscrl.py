@@ -1155,7 +1155,7 @@ class DSCLREvaluatorEngine:
         )
         
         selected_queries = self._select_extreme_queries(
-            og_metrics, query_neg_scores, q_raw_og, q_raw_changed
+            og_metrics, query_neg_scores, q_raw_og, q_raw_changed, alpha_0_result
         )
         
         markdown_output = self._generate_query_analysis_markdown(
@@ -1258,9 +1258,13 @@ class DSCLREvaluatorEngine:
         og_metrics: List[Dict[str, Any]],
         query_neg_scores: Dict[str, Dict[str, float]],
         q_raw_og: Dict[str, Tuple[str, str]],
-        q_raw_changed: Dict[str, Tuple[str, Tuple[str, str]]]
+        q_raw_changed: Dict[str, Tuple[str, Tuple[str, str]]],
+        alpha_0_result: Optional[Dict]
     ) -> List[Dict[str, Any]]:
         """选择4种极端类型的Query"""
+        
+        # 从 alpha_0_result 获取所有文档的 S_neg_proj 用于计算平均
+        results_changed = alpha_0_result.get('results_changed', {}) if alpha_0_result else {}
         
         query_type_scores = {}
         for m in og_metrics:
@@ -1268,11 +1272,14 @@ class DSCLREvaluatorEngine:
             mrr = m['mrr']
             
             neg_info = query_neg_scores.get(qid, {})
-            avg_neg_score = 0.0
             
-            if neg_info.get('doc_scores'):
-                scores = [d['score'] for d in neg_info['doc_scores'].values()]
-                avg_neg_score = np.mean(scores) if scores else 0.0
+            # 计算平均负向得分：使用所有文档的 S_neg_proj，不只是包含负向词的文档
+            changed_key = f"{qid}-changed"
+            if changed_key in results_changed:
+                all_scores = [score for _, score in results_changed[changed_key]]
+                avg_neg_score = np.mean(all_scores) if all_scores else 0.0
+            else:
+                avg_neg_score = 0.0
             
             query_type_scores[qid] = {
                 'mrr': mrr,
