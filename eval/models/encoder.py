@@ -104,12 +104,19 @@ class ModelFactory:
         """创建模型实例
         
         自动识别模型类型：
+        - repllama: 使用 RepLLaMAEncoder
         - e5-mistral: 使用 E5MistralEncoder
         - 其他: 使用 SentenceTransformerEncoder
         """
         # 检查是否已注册
         if model_name in cls._models:
             return cls._models[model_name](**kwargs)
+        
+        # 自动识别 RepLLaMA 模型
+        if "repllama" in model_name.lower():
+            from .repllama_encoder import RepLLaMAEncoder
+            logger.info(f"🔍 自动识别为 RepLLaMA 模型: {model_name}")
+            return RepLLaMAEncoder(model_name=model_name, **kwargs)
         
         # 自动识别 E5-Mistral 模型
         if "e5-mistral" in model_name.lower():

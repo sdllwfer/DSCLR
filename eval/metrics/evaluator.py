@@ -34,16 +34,24 @@ class DataLoader:
         return path_map.get(task_name, "")
     
     def load_qrels(self) -> Dict[str, Dict[str, int]]:
-        """加载 qrels - 相关性标签"""
+        """加载 qrels - 相关性标签
+        
+        根据数据集特点处理相关性分数：
+        - Core17/Robust04: 使用 MAP，需要二分类（score > 0 -> 1）
+        - News21: 使用 nDCG@5，保留多级评分
+        """
         ds_qrels = datasets.load_dataset(self.dataset_path, 'default')
         q_split = 'test' if 'test' in ds_qrels else list(ds_qrels.keys())[0]
         qrels = {}
+        
         for item in ds_qrels[q_split]:
             qid = item.get('query-id', item.get('query_id', ''))
             doc_id = str(item.get('corpus-id', item.get('doc_id', '')))
             relevance = int(item.get('score', item.get('relevance', 1)))
+            
             if qid not in qrels:
                 qrels[qid] = {}
+            
             qrels[qid][doc_id] = relevance
         
         logger.info(f"   ✅ 加载 qrels: {len(qrels)} 个查询")
@@ -65,15 +73,34 @@ class DataLoader:
         return changed_qrels
     
     def load_corpus(self) -> Dict[str, Dict[str, str]]:
-        """加载文档集合"""
+        """加载文档集合
+        
+        注意：FollowIR 数据集包含 title 和 text 字段
+        根据 RepLLaMA 论文，应该将标题和正文合并：Title + " " + Text
+        """
         ds_c = datasets.load_dataset(self.dataset_path, 'corpus')
         c_split = 'corpus' if 'corpus' in ds_c else 'train'
         corpus = {}
         for d in ds_c[c_split]:
             doc_id = str(d.get('_id', d.get('id')))
-            corpus[doc_id] = {'text': str(d.get('text', ''))}
+            
+            # 提取标题和正文
+            title = str(d.get('title', ''))
+            text = str(d.get('text', ''))
+            
+            # 合并标题和正文（RepLLaMA 标准）
+            if title and title != 'None':
+                full_text = f"{title} {text}"
+            else:
+                full_text = text
+            
+            corpus[doc_id] = {
+                'text': full_text,
+                'title': title,
+                'body': text
+            }
         
-        logger.info(f"   ✅ 加载 {len(corpus)} 个文档")
+        logger.info(f"   ✅ 加载 {len(corpus)} 个文档（含标题）")
         return corpus
     
     def load_queries(self) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -199,12 +226,14 @@ class FollowIREvaluator:
                 "ndcg_at_5": scores.get('og', {}).get('ndcg_at_5', 0),
                 "ndcg_at_10": scores.get('og', {}).get('ndcg_at_10', 0),
                 "map_at_1000": scores.get('og', {}).get('map_at_1000', 0),
+                "mrr_at_10": scores.get('og', {}).get('mrr_at_10', 0),
             },
             "changed": {
                 "ndcg_at_1": scores.get('changed', {}).get('ndcg_at_1', 0),
                 "ndcg_at_5": scores.get('changed', {}).get('ndcg_at_5', 0),
                 "ndcg_at_10": scores.get('changed', {}).get('ndcg_at_10', 0),
                 "map_at_1000": scores.get('changed', {}).get('map_at_1000', 0),
+                "mrr_at_10": scores.get('changed', {}).get('mrr_at_10', 0),
             },
             "full_scores": scores
         }

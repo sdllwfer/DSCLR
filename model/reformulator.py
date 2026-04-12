@@ -241,6 +241,11 @@ class DualQueryCache:
     
     def _get_cache_file(self, task_name: str) -> str:
         """获取指定任务的缓存文件路径"""
+        import glob
+        pattern = os.path.join(self.cache_dir, f"dual_queries_*_{task_name}.jsonl")
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
         return os.path.join(self.cache_dir, f"dual_queries_v4_{task_name}.jsonl")
     
     def _get_version_file(self, task_name: str) -> str:
