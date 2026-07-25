@@ -1,0 +1,51 @@
+\begin{tikzpicture}[
+  font=\small,
+  >=Latex,
+  arrow/.style={-{Latex[length=2.2mm,width=1.3mm]}, draw=black!68, line width=0.55pt},
+  box/.style={draw=black!68, line width=0.55pt, rounded corners=1.2pt,
+              align=center, fill=white, inner xsep=4pt, inner ysep=5pt},
+  input/.style={box, fill=black!3, minimum width=1.45cm, minimum height=0.82cm},
+  full/.style={box, fill=blue!7, draw=blue!48!black, minimum width=1.72cm},
+  view/.style={box, fill=green!7, draw=green!42!black, minimum width=1.95cm},
+  process/.style={box, fill=black!3, minimum width=1.65cm, minimum height=0.84cm},
+  scores/.style={box, fill=black!3, minimum width=2.12cm, minimum height=1.02cm},
+  residual/.style={box, fill=orange!9, draw=orange!58!black,
+                   minimum width=2.35cm, minimum height=1.02cm},
+  final/.style={box, fill=purple!8, draw=purple!48!black,
+                minimum width=2.35cm, minimum height=1.02cm},
+  stage/.style={font=\small\bfseries, text=black!68}
+]
+
+\node[input] (instruction) at (0.80,0) {Instruction\\$u$};
+\node[full] (qfull) at (2.85,0.68) {Preserved view\\$Q_{\mathrm{full}}=u$};
+\node[process, minimum width=1.85cm] (decompose) at (2.85,-0.68)
+  {One LLM\\decomposition};
+\node[process] (retrieve) at (5.10,0.68) {Frozen\\retrieval};
+\node[view] (views) at (5.10,-0.68)
+  {Focused views\\$Q_{\mathrm{pos}},\;Q_{\mathrm{minus}}$};
+\node[scores] (channels) at (7.75,0)
+  {Same candidates $\mathcal C_u$\\$S_{\mathrm{full}},S_{\mathrm{pos}},S_{\mathrm{neg}}$};
+
+\node[process, minimum width=1.72cm] (normalize) at (10.15,0)
+  {Robust\\normalization};
+\node[residual] (fit) at (12.65,0)
+  {Residualization\\$r=z_{\mathrm{neg}}-(\hat a+$\\$\hat b z_{\mathrm{pos}})$};
+\node[final] (compose) at (15.35,0)
+  {Thresholded decision\\$z_{\mathrm{full}}+p\,g-h$\\$\rightarrow$ final ranking};
+
+\draw[arrow] (instruction) -- (qfull);
+\draw[arrow] (instruction) -- (decompose);
+\draw[arrow] (qfull) -- (retrieve);
+\draw[arrow] (decompose) -- (views);
+\draw[arrow] (retrieve.east) -- ++(0.28,0) |- (channels.north west);
+\draw[arrow] (views.east) -- ++(0.28,0) |- (channels.south west);
+\draw[arrow] (channels) -- (normalize);
+\draw[arrow] (normalize) -- (fit);
+\draw[arrow] (fit) -- (compose);
+
+\node[stage, anchor=west] at (0.05,1.55) {Frozen evidence construction};
+\node[stage, anchor=west] at (9.35,1.55) {Candidate-conditional decision layer};
+\draw[draw=black!28, densely dashed, line width=0.5pt]
+  (9.00,-1.23) -- (9.00,1.38);
+
+\end{tikzpicture}
