@@ -425,6 +425,9 @@ class TRACEEvaluator(DSCLREvaluatorEngine):
         elif self.ablation == "pos_only":
             # Only positive channel: S = z_full + p
             s_final = z_full + p
+        elif self.ablation == "neg_only":
+            # Only negative channel: S = z_full - h (exclude Q+ reward, use Q- penalty only)
+            s_final = z_full - h
         elif self.ablation == "linear":
             # Linear fusion: S = z_full + p - r (no gate, no boundary)
             s_final = z_full + p - r

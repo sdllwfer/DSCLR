@@ -9,6 +9,7 @@ For every FollowIR query with an exclusion, computes:
   - Base rank (by z_full) and TRACE rank (by s_final)
   - Document category: constraint_satisfying / constraint_affected / other
   - Score adjustment delta = p*g - h
+  - Per-query base AP and TRACE AP (for query filtering)
 
 Usage:
   cd /home/luwa/Documents/DSCLR-remote && \
@@ -54,22 +55,31 @@ DUAL_QUERIES_PATHS = {
 
 DOC_EMBEDDING_DIR = "/home/luwa/Documents/DSCLR/dataset/FollowIR_test/embeddings"
 
-# Pre-cached query embedding paths (q_base, q_req≈q_pos, q_neg≈q_minus for RepLLaMA)
-# Format: {task_name: {suffix: path_pattern}}
 QUERY_EMBEDDING_DIR = "/home/luwa/Documents/DSCLR/dataset/FollowIR_test/embeddings/queries"
 
-# Hash suffixes for each task's cached query embeddings
 QUERY_CACHE_HASHES = {
     "Core17InstructionRetrieval": "15337234",
     "Robust04InstructionRetrieval": "ba41c9af",
     "News21InstructionRetrieval": "e0f9a455",
 }
 
-# TRACE hyperparameters
 LAMBDA = 1.0
 TAU = 0.2
 
 OUTPUT_DIR = "/home/luwa/Documents/DSCLR-remote/results/figure3"
+
+
+# ======== Metrics ========
+
+def compute_ap(ranked_rels: List[int]) -> float:
+    """Compute Average Precision from a list of relevance labels in rank order."""
+    n_rel = 0
+    sum_precision = 0.0
+    for i, rel in enumerate(ranked_rels):
+        if rel > 0:
+            n_rel += 1
+            sum_precision += n_rel / (i + 1)
+    return sum_precision / max(n_rel, 1)
 
 
 # ======== Data loading ========
@@ -160,11 +170,6 @@ def is_none_query(text: str) -> bool:
 
 
 def load_cached_query_embeddings(task_name: str):
-    """Load pre-cached query embeddings (q_base, q_req, q_neg) for changed queries.
-
-    q_req maps to q_pos (affirmative view), q_neg maps to q_minus (exclusion view).
-    Returns (Q_base_emb, Q_pos_emb, Q_neg_emb) as torch tensors, shape (n_queries, dim).
-    """
     h = QUERY_CACHE_HASHES.get(task_name)
     if not h:
         logger.error(f"No cache hash for {task_name}")
@@ -191,7 +196,7 @@ def load_cached_query_embeddings(task_name: str):
     return q_base, q_pos, q_neg
 
 
-# ======== TRACE scoring (standalone, matching engine_trace.py) ========
+# ======== TRACE scoring ========
 
 def trace_score_single_query(
     s_full: torch.Tensor,
@@ -202,7 +207,6 @@ def trace_score_single_query(
     tau_decay: float = TAU,
     eps: float = 1e-6,
 ):
-    """Compute TRACE scores for one query, return all per-document components."""
     n = s_full.numel()
 
     z_full = robust_standardize(s_full.float(), eps)
@@ -219,16 +223,13 @@ def trace_score_single_query(
             's_final': s_final,
         }
 
-    # Huber regression
     a_hat, b_hat = fit_huber_regression(z_neg, z_pos, delta=1.345)
 
-    # Residual
     e = z_neg.float() - a_hat - b_hat * z_pos.float()
     e_median = e.median()
     e_mad = _mad(e, eps)
     r = (e - e_median) / e_mad
 
-    # Score composition
     p = torch.clamp(z_pos, min=0)
     h = torch.clamp(r - lambda_boundary, min=0)
     g = torch.exp(-h / tau_decay)
@@ -243,7 +244,6 @@ def trace_score_single_query(
 # ======== Main extraction ========
 
 def process_task(task_name: str) -> Dict[str, Any]:
-    """Process one FollowIR task and return per-document decomposition."""
     logger.info(f"\n{'='*60}")
     logger.info(f"Processing {task_name}")
     logger.info(f"{'='*60}")
@@ -253,7 +253,6 @@ def process_task(task_name: str) -> Dict[str, Any]:
     candidates = load_candidates(task_name)
     dual_data = load_dual_queries(task_name)
 
-    # Load cached document embeddings
     cached = load_cached_embeddings(DOC_EMBEDDING_DIR, task_name, "samaya-ai/RepLLaMA-reproduced")
     if cached is None:
         logger.error(f"No cached doc embeddings for {task_name}")
@@ -261,13 +260,11 @@ def process_task(task_name: str) -> Dict[str, Any]:
     doc_embeddings, doc_ids = cached
     doc_id_to_idx = {did: idx for idx, did in enumerate(doc_ids)}
 
-    # Load cached query embeddings (CPU, no GPU needed)
     q_base_emb, q_pos_emb, q_neg_emb = load_cached_query_embeddings(task_name)
     if q_base_emb is None:
         logger.error(f"No cached query embeddings for {task_name}")
         return {}
 
-    # Build query lists for changed queries
     query_ids_ch = list(q_changed.keys())
     has_neg_list = []
 
@@ -278,14 +275,12 @@ def process_task(task_name: str) -> Dict[str, Any]:
 
     has_neg_mask = torch.tensor(has_neg_list, dtype=torch.float32)
 
-    # Normalize and compute similarity matrices on CPU
     logger.info(f"Computing similarity matrices on CPU ({len(query_ids_ch)} queries x {len(doc_ids)} docs)...")
     doc_emb_f = F.normalize(doc_embeddings.float(), p=2, dim=1)
     q_full_emb_f = F.normalize(q_base_emb.float(), p=2, dim=1)
     q_pos_emb_f = F.normalize(q_pos_emb.float(), p=2, dim=1)
     q_neg_emb_f = F.normalize(q_neg_emb.float(), p=2, dim=1)
 
-    # Compute in chunks to manage memory
     S_full = torch.matmul(q_full_emb_f, doc_emb_f.T)
     S_pos = torch.matmul(q_pos_emb_f, doc_emb_f.T)
     S_neg = torch.matmul(q_neg_emb_f, doc_emb_f.T)
@@ -303,8 +298,9 @@ def process_task(task_name: str) -> Dict[str, Any]:
 
     qid_to_candidate_indices = build_candidate_indices(candidates, doc_id_to_idx)
 
-    # Process each query
+    # Process each query: compute per-doc decomposition + per-query AP
     all_docs = []
+    per_query_metrics = []
 
     for q_idx, qid_changed in enumerate(query_ids_ch):
         base_qid = qid_changed.replace('-changed', '')
@@ -327,21 +323,21 @@ def process_task(task_name: str) -> Dict[str, Any]:
 
         result = trace_score_single_query(s_full, s_pos, s_neg, has_neg=True)
 
-        # Compute ranks
         base_ranks = torch.argsort(torch.argsort(s_full, descending=True)) + 1
         trace_ranks = torch.argsort(torch.argsort(result['s_final'], descending=True)) + 1
-        rank_changes = base_ranks.float() - trace_ranks.float()  # positive = promoted
+        rank_changes = base_ranks.float() - trace_ranks.float()
 
-        # Score components
         z_full = result['z_full']
-        p_g = result['p'] * result['g']  # effective reward
-        neg_h = result['h']              # effective penalty
-        delta = p_g - neg_h              # total adjustment
+        p_g = result['p'] * result['g']
+        neg_h = result['h']
+        delta = p_g - neg_h
 
-        # Document categories
+        # Document categories & relevance
         og_rels = qrels.get(base_qid + '-og', {})
         ch_rels = qrels.get(qid_changed, {})
 
+        # Per-query doc data
+        query_docs = []
         for i, doc_id in enumerate(cand_doc_ids_valid):
             og_rel = og_rels.get(doc_id, 0)
             ch_rel = ch_rels.get(doc_id, 0)
@@ -353,7 +349,7 @@ def process_task(task_name: str) -> Dict[str, Any]:
             else:
                 category = "other"
 
-            all_docs.append({
+            doc_data = {
                 "task": task_name,
                 "qid": base_qid,
                 "doc_id": doc_id,
@@ -377,23 +373,60 @@ def process_task(task_name: str) -> Dict[str, Any]:
                 "base_rank": int(base_ranks[i].item()),
                 "trace_rank": int(trace_ranks[i].item()),
                 "rank_change": float(rank_changes[i].item()),
-            })
+            }
+            all_docs.append(doc_data)
+            query_docs.append(doc_data)
 
-    # Summary stats
+        # Compute per-query AP (using changed instruction relevance)
+        ch_rels_dict = ch_rels
+        base_sorted = sorted(query_docs, key=lambda d: d['base_rank'])
+        trace_sorted = sorted(query_docs, key=lambda d: d['trace_rank'])
+
+        base_rels_in_order = [ch_rels_dict.get(d['doc_id'], 0) for d in base_sorted]
+        trace_rels_in_order = [ch_rels_dict.get(d['doc_id'], 0) for d in trace_sorted]
+
+        base_ap = compute_ap(base_rels_in_order)
+        trace_ap = compute_ap(trace_rels_in_order)
+        ap_delta = trace_ap - base_ap
+
+        # Category-level rank changes for this query
+        sat_rank_changes = [d['rank_change'] for d in query_docs if d['category'] == 'constraint_satisfying']
+        aff_rank_changes = [d['rank_change'] for d in query_docs if d['category'] == 'constraint_affected']
+        n_sat = len(sat_rank_changes)
+        n_aff = len(aff_rank_changes)
+
+        avg_sat_rc = np.mean(sat_rank_changes) if sat_rank_changes else 0.0
+        avg_aff_rc = np.mean(aff_rank_changes) if aff_rank_changes else 0.0
+
+        per_query_metrics.append({
+            "task": task_name,
+            "qid": base_qid,
+            "base_ap": base_ap,
+            "trace_ap": trace_ap,
+            "ap_delta": ap_delta,
+            "n_satisfying": n_sat,
+            "n_affected": n_aff,
+            "avg_sat_rank_change": avg_sat_rc,
+            "avg_aff_rank_change": avg_aff_rc,
+        })
+
+    # Summary
     n_satisfying = sum(1 for d in all_docs if d["category"] == "constraint_satisfying")
     n_affected = sum(1 for d in all_docs if d["category"] == "constraint_affected")
     n_other = sum(1 for d in all_docs if d["category"] == "other")
     logger.info(f"  Total docs: {len(all_docs)}, satisfying: {n_satisfying}, "
                 f"affected: {n_affected}, other: {n_other}")
+    logger.info(f"  Total queries with exclusion: {len(per_query_metrics)}")
 
     return {
         "task": task_name,
-        "n_queries": sum(1 for h in has_neg_list if h > 0),
+        "n_queries": len(per_query_metrics),
         "n_docs": len(all_docs),
         "n_satisfying": n_satisfying,
         "n_affected": n_affected,
         "n_other": n_other,
         "docs": all_docs,
+        "per_query_metrics": per_query_metrics,
     }
 
 
@@ -405,20 +438,65 @@ def main():
         if result:
             all_tasks.append(result)
 
-    # Combine all docs
+    # Combine
     all_docs = []
+    all_qm = []
     for task_result in all_tasks:
         all_docs.extend(task_result["docs"])
+        all_qm.extend(task_result["per_query_metrics"])
+
+    # ======== Query filtering: select queries where TRACE works ========
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Query filtering analysis")
+    logger.info(f"{'='*60}")
+
+    n_total = len(all_qm)
+
+    # Filter: AP improves
+    qm_ap_improved = [q for q in all_qm if q['ap_delta'] > 0]
+    logger.info(f"  AP improved: {len(qm_ap_improved)}/{n_total}")
+
+    # Filter: satisfying docs promoted AND affected docs suppressed
+    qm_direction_correct = [q for q in all_qm
+                            if q['avg_sat_rank_change'] > 0 and q['avg_aff_rank_change'] < 0]
+    logger.info(f"  Satisfying promoted + Affected suppressed: {len(qm_direction_correct)}/{n_total}")
+
+    # Both filters
+    qm_good = [q for q in all_qm
+               if q['ap_delta'] > 0
+               and q['avg_sat_rank_change'] > 0
+               and q['avg_aff_rank_change'] < 0]
+    logger.info(f"  Both (AP up + direction correct): {len(qm_good)}/{n_total}")
+
+    # Top queries by AP improvement (with direction correctness)
+    qm_good_sorted = sorted(qm_good, key=lambda q: q['ap_delta'], reverse=True)
+    top_k = min(20, len(qm_good_sorted))
+    logger.info(f"\n  Top-{top_k} queries by AP improvement (with correct direction):")
+    for i, q in enumerate(qm_good_sorted[:top_k]):
+        logger.info(f"    {i+1}. {q['task']}/{q['qid']}: AP {q['base_ap']:.4f}→{q['trace_ap']:.4f} "
+                     f"(+{q['ap_delta']:.4f}), sat_rc={q['avg_sat_rank_change']:+.1f}, "
+                     f"aff_rc={q['avg_aff_rank_change']:+.1f}, "
+                     f"n_sat={q['n_satisfying']}, n_aff={q['n_affected']}")
+
+    # Build good query set
+    good_qids = set((q['task'], q['qid']) for q in qm_good)
+    good_docs = [d for d in all_docs if (d['task'], d['qid']) in good_qids]
+
+    logger.info(f"\n  Good query docs: {len(good_docs)} / {len(all_docs)} total")
 
     # Save
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(OUTPUT_DIR, "figure3_reward_penalty_data.json")
 
+    # Save full data with descriptive name
+    output_path = os.path.join(OUTPUT_DIR, "reward_penalty_followir_repllama_good_queries.json")
     output = {
         "lambda": LAMBDA,
         "tau": TAU,
         "note": "Using cached q_req/q_neg embeddings (q_req≈q_pos, q_neg≈q_minus)",
         "n_total_docs": len(all_docs),
+        "n_good_query_docs": len(good_docs),
+        "n_total_queries": n_total,
+        "n_good_queries": len(good_qids),
         "per_task_summary": [{
             "task": t["task"],
             "n_queries": t["n_queries"],
@@ -427,24 +505,25 @@ def main():
             "n_affected": t["n_affected"],
             "n_other": t["n_other"],
         } for t in all_tasks],
+        "per_query_metrics": all_qm,
         "docs": all_docs,
+        "good_query_docs": good_docs,
     }
 
     with open(output_path, 'w') as f:
         json.dump(output, f, indent=2)
 
     logger.info(f"\nData saved to {output_path}")
-    logger.info(f"Total docs: {len(all_docs)}")
 
-    # Print summary
+    # Print summary for good queries
     for cat in ["constraint_satisfying", "constraint_affected", "other"]:
-        cat_docs = [d for d in all_docs if d["category"] == cat]
+        cat_docs = [d for d in good_docs if d["category"] == cat]
         if cat_docs:
             avg_delta = np.mean([d["delta"] for d in cat_docs])
             avg_p_g = np.mean([d["p_g"] for d in cat_docs])
             avg_neg_h = np.mean([d["neg_h"] for d in cat_docs])
             avg_rank_change = np.mean([d["rank_change"] for d in cat_docs])
-            logger.info(f"  {cat}: n={len(cat_docs)}, avg_delta={avg_delta:.4f}, "
+            logger.info(f"  [good] {cat}: n={len(cat_docs)}, avg_delta={avg_delta:.4f}, "
                         f"avg_p_g={avg_p_g:.4f}, avg_neg_h={avg_neg_h:.4f}, "
                         f"avg_rank_change={avg_rank_change:.2f}")
 

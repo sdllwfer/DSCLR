@@ -21,19 +21,13 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{booktabs}
-\usepackage{subcaption}
-\usepackage{algorithm}
-\usepackage{algorithmic}
 \usepackage{multirow}
-\usepackage{xcolor}
 \usepackage{xspace}
-\usepackage{tikz}
-\usetikzlibrary{arrows.meta,calc,positioning}
 
 % ============================================================
 % Custom macros
 % ============================================================
-\newcommand{\method}{TRIX\xspace}
+\newcommand{\method}{\ifmmode \mathrm{TRIX}\else TRIX\xspace\fi}
 \newcommand{\qbase}{Q_{\text{full}}}
 \newcommand{\qpos}{Q_{\text{pos}}}
 \newcommand{\qneg}{Q_{\text{neg}}}
@@ -41,7 +35,6 @@
 \newcommand{\spos}{S_{\text{pos}}}
 \newcommand{\sneg}{S_{\text{neg}}}
 \newcommand{\sfinal}{S_{\text{final}}}
-\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO] #1}}}
 
 \pdfinfo{
 /TemplateVersion (2027.1)
@@ -54,11 +47,9 @@
 % ============================================================
 \title{TRIX: Training-Free Reranking for Instruction-Following Retrieval with Exclusions}
 \author{
-    Anonymous Authors
+    Anonymous Submission
 }
-\affiliations{
-    Anonymous Institution
-}
+\affiliations{}
 
 \begin{document}
 
@@ -82,10 +73,10 @@ exclusion scores to penalize relevant content.  \method{} removes the exclusion
 similarity predicted by affirmative relevance, then uses the residual to reduce
 positive scores and suppress exclusion matches.  It requires no additional
 training data, model updates, or document re-encoding.  Across three benchmarks
-and four frozen retrievers, \method{} improves retrieval
-effectiveness and instruction sensitivity, increasing the latter by up to 15.6
-points and outperforming the strongest reported training-free baseline on
-retrieval with exclusion constraints by up to 3.3 points.
+and four frozen retrievers, \method{} improves retrieval effectiveness and
+instruction sensitivity, increasing the latter by up to 16.4 points and
+outperforming the strongest reported training-free baseline on retrieval with
+exclusion constraints by up to 3.3 points.
 \end{abstract}
 
 % ============================================================
@@ -98,62 +89,78 @@ Retrieval requests often combine a target topic with positive relevance
 criteria, background context, and explicit exclusions.  Frozen retrievers rely
 mainly on lexical and semantic matching, but these signals do not reliably
 capture how each part of an instruction affects relevance.  The problem is
-especially clear for exclusions: an excluded entity still appears in the
-request and can become a strong matching signal.  Consider a request for
-evidence that a US college education improves employment or income while
-excluding documents about Manhattan colleges such as Columbia University.
-Documents about employment outcomes for Columbia graduates match the topic and
-entities in the request, yet they violate the exclusion.  This behavior agrees
-with evidence that neural rankers are often insensitive to meaning changes
-introduced by negation
-\cite{DBLP:conf/eacl/WellerLD24,weller-etal-2025-followir}.
+especially clear for exclusions because the excluded entity remains part of
+the request.  In lexical retrieval, it contributes matching terms like any
+other query content.  Dense retrievers face a related limitation: pooled
+embeddings compress topical content and compositional roles into a single
+vector, and cosine scoring can keep texts with similar content but different
+negation or scope close in the embedding space
+\cite{DBLP:journals/corr/abs-2604-16351}.  A document can therefore receive a
+higher score for matching an entity that the user explicitly asks to exclude.
+Figure~\ref{fig:trix-overview} illustrates a request for evidence that a US
+college education improves employment or income while excluding documents
+about Manhattan colleges such as Columbia University.  Documents about
+employment outcomes for Columbia graduates match the topic and entities in the
+request, yet they violate the exclusion.  This behavior agrees with evidence
+that neural rankers are often insensitive to meaning changes introduced by
+negation \cite{DBLP:conf/eacl/WellerLD24,DBLP:conf/naacl/WellerCMLCDLS25}.
 
 Separating the instruction into positive and exclusion views is a natural way
-to make these roles explicit.  This decomposition also exposes a second
-problem: the two views can still share topic information.  A relevant document
-about a college outside Manhattan, for example, may score highly against the
-exclusion ``Manhattan colleges such as Columbia University'' because both
-concern US colleges and graduate outcomes.  The exclusion score then reflects
-both shared topic information and evidence specific to the excluded content.
-Penalizing the complete score can therefore suppress documents that satisfy the
-request.
+to make these roles explicit.  However, the two views can still share topic
+information.  In Figure~\ref{fig:trix-overview}, the fifth-ranked document
+satisfies the request and does not discuss the excluded Manhattan colleges,
+but retrieval scores are based mainly on lexical or embedding similarity.
+Its broader discussion of US colleges and graduate outcomes therefore raises
+its scores under both the affirmative and exclusion views.  Directly
+subtracting the exclusion score would penalize a relevant document.  An
+effective correction must distinguish evidence of the excluded content from
+similarity caused by the shared topic.
 
-Existing work introduces instruction control through learned representations,
-inference-time query adaptation, or explicit constraint reasoning
-\cite{weller2024promptriever,dualview2026,gao2026instemb,deo2026,
-xu2025logical,hoveyda2026orlog}.  Task-aware and instruction-tuned retrievers
-show that natural-language descriptions can condition retrieval across tasks
-and domains \cite{DBLP:conf/acl/AsaiSL0I0HY23,
-DBLP:conf/acl/SuSKWHOYSZ023,DBLP:conf/iclr/CaiT0XGL0J23}.  These approaches
-typically adapt the representation space or introduce an additional reasoning
-procedure.  A complementary question is whether the scores of a frozen
-retriever can be corrected directly, without retraining the model or rebuilding
-the document index.  Such a correction must retain affirmative relevance while
-distinguishing exclusion evidence from shared topical similarity.
+Prior methods introduce instruction control through instruction-trained
+retrieval, inference-time query adaptation, or logic-based constraint
+modeling.  Instruction-trained retrievers such as Promptriever
+\cite{DBLP:conf/iclr/WellerDLPZH25}, Dual-View Training \cite{dualview2026}, and
+InstEmb \cite{gao2026instemb} learn instruction-conditioned representations,
+but require additional supervision and model training.  Inference-time query
+adaptation methods such as DEO
+\cite{DBLP:journals/corr/abs-2603-09185} modify the query embedding at
+inference time, but direct optimization can move the query vector away from
+the embedding structure learned by the retriever, making its similarity to
+document embeddings less reliable.  Logic-based constraint methods such as NS-IR
+\cite{xu2025logical} and OrLog \cite{hoveyda2026orlog} translate instructions
+into logical structures and apply symbolic or probabilistic inference over the
+retrieved candidates.  The additional translation, candidate-level model
+calls, and formal inference increase online retrieval latency.
 
-We propose \method, a training-free reranking framework for this setting.
+We therefore introduce \method, a training-free reranking framework that
+corrects the scores of a frozen retriever without updating its representations,
+re-encoding documents, or adding candidate-level constraint inference.
 \method retains the complete instruction for initial retrieval, derives an
 affirmative view that focuses the positive criteria and removes irrelevant
-background context, and represents excluded content in a separate view.  For
-each request, it estimates the component of the exclusion score predicted by
-the affirmative score and uses the standardized residual as exclusion
-evidence.  The final scoring rule preserves affirmative support when this
-evidence is weak, then reduces that support and applies an exclusion penalty as
-the residual increases.  This design operates on the scores of a frozen
-retriever and requires no document re-encoding.
+background context, and represents excluded content in a separate view.  It
+uses a query-local residual as a proxy for exclusion evidence beyond topical
+match.  Based on this signal, the final scoring rule preserves or reduces
+affirmative support and applies an exclusion penalty.
 
-Across FollowIR, NegConstraint, and ExcluIR, \method improves instruction-aware
+Across an instruction-following benchmark (FollowIR) and two exclusion-aware
+benchmarks (NegConstraint and ExcluIR), \method improves instruction-aware
 ranking across sparse and dense frozen retrievers.  It raises instruction
-sensitivity by up to 15.6 points and exceeds the strongest reported
-training-free reference on explicit-exclusion retrieval by up to 3.3 points.
-Our contributions are threefold: (i) we introduce a training-free IF-IR
-framework that uses full, affirmative, and exclusion views to handle positive
-criteria, background context, and exclusions; (ii) we introduce residual
-correction to separate exclusion-specific evidence from shared topic
-information, together with a scoring rule that combines relevance promotion
-and exclusion suppression; and (iii) we provide controlled evidence across
-three benchmarks and multiple retriever families, separating the effects of
-evidence construction, residualization, and score composition.
+sensitivity by up to 16.4 points and outperforms the strongest reported
+training-free method on exclusion-aware retrieval by up to 3.3 points.
+
+Our contributions are:
+\begin{itemize}
+    \item[$\bullet$] We introduce a training-free reranking framework that uses full,
+    affirmative, and exclusion views to handle positive criteria, background
+    context, and exclusions without retriever updates or document re-encoding.
+    \item[$\bullet$] We use residual correction to obtain a query-local proxy
+    for exclusion evidence beyond topical match, then combine relevance
+    promotion and exclusion suppression according to this signal.
+    \item[$\bullet$] Across three benchmarks and multiple frozen retrievers, we
+    demonstrate consistent improvements and isolate the effects of view
+    construction, residual scoring, and final score correction, while
+    maintaining general retrieval effectiveness on eight BEIR datasets.
+\end{itemize}
 
 % ============================================================
 % 2. RELATED WORK
@@ -161,93 +168,125 @@ evidence construction, residualization, and score composition.
 \section{Related Work}
 \label{sec:related-work}
 
-\subsection{Learning Instruction-Following Retrievers}
+Prior work on instruction control in retrieval falls into three groups:
+instruction-trained retrieval, inference-time query adaptation, and logic-based
+constraint modeling.
 
-Instruction-following behavior can be learned through retriever adaptation.
-Early task-aware retrieval systems condition relevance on natural-language
-task descriptions: TART uses multitask instruction tuning, INSTRUCTOR learns a
-shared instruction-conditioned embedding space, and HypeR composes
-task-dependent prompts for cross-domain retrieval
-\cite{DBLP:conf/acl/AsaiSL0I0HY23,DBLP:conf/acl/SuSKWHOYSZ023,
-DBLP:conf/iclr/CaiT0XGL0J23}.
-FollowIR-7B, Promptriever, and InF-IR train retrievers with natural-language
-relevance instructions, while Dual-View Training adds polarity-reversed
-supervision
-\cite{weller-etal-2025-followir,weller2024promptriever,zhuang2025infir,
-dualview2026}.  InstEmb instead combines input-intrinsic and output-aware
-semantic signals when learning instruction-following embeddings
-\cite{gao2026instemb}.  In each case, instruction sensitivity is encoded by the
-training data and objective.  \method{} keeps the representation function fixed
-and introduces instruction control at the ranking stage.
+\subsection{Instruction-Trained Retrieval}
+
+Instruction-trained retrievers learn to score documents according to
+natural-language instructions.
+TART uses multitask instruction tuning with natural-language task descriptions
+\cite{DBLP:conf/acl/AsaiSL0I0HY23}.
+INSTRUCTOR learns a shared instruction-conditioned embedding space
+\cite{DBLP:conf/acl/SuSKWHOYSZ023}.  HypeR composes task-dependent prompts for
+cross-domain retrieval \cite{DBLP:conf/iclr/CaiT0XGL0J23}.  More recent systems
+train directly with relevance instructions, including FollowIR-7B
+\cite{DBLP:conf/naacl/WellerCMLCDLS25}, Promptriever
+\cite{DBLP:conf/iclr/WellerDLPZH25},
+and InF-IR \cite{zhuang2025infir}.  Dual-View Training adds
+polarity-reversed supervision \cite{dualview2026}, while InstEmb combines
+input-intrinsic and output-aware signals when learning instruction-following
+embeddings \cite{gao2026instemb}.
+
+These training-based methods require instruction-specific data and updates to
+the retriever parameters.  Targeted negation augmentation likewise requires
+additional training data \cite{DBLP:conf/emnlp/SinghKS23}, and supporting new
+instruction types can require further data and retraining.  \method{} keeps the
+retriever and its representation function fixed and introduces instruction
+control during reranking.
 
 \subsection{Inference-Time Query Adaptation}
 
-Inference-time methods expose structure that a monolithic query may obscure.
-Query rewriting and expansion reformulate the request to improve relevance
-matching \cite{gao2023hyde,wang2023query2doc,raudaschl2024ragfusion,
-li2025deepretrieval}.  Stage-Aware Decomposition retains the complete query for
-initial retrieval and additively aggregates decomposed condition scores during
-reranking, treating each condition as positive matching evidence
-\cite{yin2026stageaware}.  DEO instead derives positive and negative subqueries
-and optimizes the query embedding toward the former and away from the latter
-\cite{deo2026}.  \method{} also decomposes the request, but neither replaces nor
-optimizes its representation.  It preserves the complete, affirmative, and
-exclusion queries as separate scoring views and resolves their evidence after
-the documents have been scored.
+Inference-time methods modify the query text or representation without
+retraining the retriever \cite{DBLP:conf/emnlp/MaGHZD23}.
+HyDE generates a hypothetical document to guide retrieval
+\cite{DBLP:conf/acl/GaoMLC23}.  Query2Doc expands the query with a generated
+pseudo-document \cite{DBLP:conf/emnlp/WangYW23}.  RAG-Fusion combines rankings
+from multiple generated queries \cite{raudaschl2024ragfusion}.  Stage-Aware
+Decomposition retains the complete query for initial retrieval and additively
+aggregates decomposed condition scores during reranking
+\cite{yin2026stageaware}.  These methods add or reformulate topical content but
+do not handle exclusion constraints.  Excluded entities can therefore remain
+strong lexical or semantic matching signals.
 
-\subsection{Constraint-Aware Ranking and Reasoning}
+Other methods directly modify or construct query representations.  DEO derives
+positive and negative subqueries and optimizes the query embedding toward the
+former and away from the latter
+\cite{DBLP:journals/corr/abs-2603-09185}.  Because the resulting vector
+is not generated by the retriever's query encoder, it may deviate from the
+learned embedding structure and make its similarity to document embeddings
+less reliable.  In vision--language retrieval,
+SpaceVLM-DRC uses
+angular composition to construct three negation-aware query directions and
+combines their image similarities with a direct image-space repulsion term
+\cite{pokhrel2026negation}.  This design assumes a unit-normalized shared
+image--text embedding space and treats direct similarity to the negated
+concept as evidence that an image contains it.  Text retrieval therefore
+requires a scoring rule that supports sparse retrievers and distinguishes
+exclusion evidence from similarity caused by shared topic information.
 
-Negation has long been a difficult case for learned representations.  Targeted
-augmentation can improve negation sensitivity in pretrained language models
-\cite{DBLP:conf/emnlp/SinghKS23}, while NevIR shows that many neural rankers
-struggle to distinguish otherwise similar documents whose meanings differ
-through negation \cite{DBLP:conf/eacl/WellerLD24}.  These studies motivate
-negation-aware modeling, but explicit exclusion retrieval additionally requires
-balancing a violation signal against the topical relevance shared by desired
-and excluded content.
+\method{} formulates instruction control as score correction over the
+retrieved documents.  It retains the complete query for candidate retrieval,
+keeps the query and document representations unchanged, estimates exclusion
+evidence from the relation between affirmative and exclusion scores, and
+combines relevance promotion with exclusion suppression.  This score-based
+formulation applies to sparse and dense text retrievers.
 
-Explicit constraints can be handled through score correction or structured
-reasoning.  In vision--language retrieval, SpaceVLM-DRC constructs multiple
-query directions and adds a repulsion penalty based on raw negated-concept
-similarity \cite{pokhrel2026negation}.  Directly penalizing raw exclusion
-similarity is unreliable in text retrieval when desired and excluded content
-share entities or topical context: a relevant document can score highly
-against both.  \method{} instead leaves query and document representations
-unchanged, removes the component of the exclusion score predicted by
-affirmative relevance, and uses the remaining residual for reranking.
+\subsection{Logic-Based Constraint Modeling}
 
-Structured approaches enforce constraints at a different inference level.
-NS-IR maps queries and documents into logical forms and enforces connective
-consistency for negative-constraint retrieval \cite{xu2025logical}, whereas
-OrLog decomposes complex requests into predicates and applies probabilistic
-reasoning \cite{hoveyda2026orlog}.  These methods target predicate-level
-constraint satisfaction, whereas \method{} provides score-level correction
-for frozen retrievers.
+Logic-based methods represent constraints explicitly before reranking.
+NS-IR translates queries and documents into first-order logic and combines
+semantic alignment with connective constraints for negative-constraint
+retrieval \cite{xu2025logical}.  OrLog decomposes entity-seeking queries into
+atomic predicates and a logical form, then uses predicate plausibility scores
+in probabilistic logic inference \cite{hoveyda2026orlog}.
+
+These methods enforce constraint composition through formal representations
+and candidate-level inference.  The required logical translation, model calls,
+and formal inference increase online latency and make retrieval depend on the
+quality of the intermediate logical representation.  \method{} operates
+directly on the scores of a frozen retriever, without translating documents
+into logical forms or invoking an external inference engine.
 
 % ============================================================
 % 3. METHODOLOGY
 % ============================================================
-\section{Methodology}
-\label{sec:method}
-
-\method has three steps.  It retrieves candidates with the complete
-instruction, scores them under affirmative and exclusion views, and corrects
-their ranks using residual exclusion evidence.  The following subsections
-define these evidence views, the residual exclusion score, and the asymmetric
-scoring rule.
-
 \begin{figure*}[t]
 \centering
-\input{Figures/method_pipeline}
-\caption{Overview of \method.  The complete instruction is used for initial
-retrieval, while affirmative and exclusion queries score the retrieved
-documents with the same frozen retriever.  \method obtains a residual exclusion
-score by robustly regressing exclusion scores on affirmative scores and uses
-the standardized residual in a thresholded reranking function.}
+\includegraphics[width=\textwidth]{Figures/framework_aaai27_raster.png}
+\caption{Overview of \method.  Stage 1, Evidence View Construction
+(Section~\ref{sec:evidence-views}), constructs full, affirmative, and exclusion
+views and retrieves candidates with the full view.  Stage 2, Residual
+Exclusion Scoring (Section~\ref{sec:residual-score}), forms a query-local
+residual after removing shared score variation over the retrieved documents.  Stage 3,
+Relevance Promotion and Exclusion Suppression
+(Section~\ref{sec:asymmetric-scoring}), converts this evidence into the final
+ranking correction.}
 \label{fig:trix-overview}
 \end{figure*}
 
-\subsection{Problem Formulation and Evidence Views}
+\section{Methodology}
+\label{sec:method}
+
+Figure~\ref{fig:trix-overview} presents the three stages of \method.
+Section~\ref{sec:evidence-views} constructs full, affirmative, and exclusion
+evidence views.  Section~\ref{sec:residual-score} computes a residual score
+as a query-local proxy for exclusion evidence beyond topical match.
+Section~\ref{sec:asymmetric-scoring} uses this score to promote affirmative
+relevance and suppress strong exclusion matches.
+
+\subsection{Evidence View Construction}
+\label{sec:evidence-views}
+
+Stage 1 in Figure~\ref{fig:trix-overview} constructs full, affirmative, and
+exclusion views while retaining the complete request for initial retrieval.
+The base ranking shows why the auxiliary views are needed: two documents about
+excluded Manhattan colleges are ranked first because they match both the
+desired college-employment topic and the excluded entities named in the
+request.  The retriever treats both forms of lexical or embedding similarity
+as positive signals without reliably distinguishing their roles in the
+instruction.
 
 \method receives a natural-language request $u$ containing the retrieval topic
 and its instructions.  The frozen retriever uses the complete request as the
@@ -260,12 +299,13 @@ with $\qbase$; the auxiliary views are used only for reranking.
 
 The three views serve different roles.  The full query retains the complete
 topic, context, and instruction during candidate generation.  The affirmative
-view removes the exclusion clause and non-criterion context to provide a
-focused relevance signal.  The exclusion view states the rejected content as a
-positive description, allowing the retriever to score whether a document
-matches that content.  In addition to supporting relevance, the affirmative
-score provides a reference for the topical component shared with the exclusion
-score.  All views use the same frozen scorer.
+view keeps the target topic and positive relevance requirements while removing
+the exclusion clause and background information that does not determine
+relevance.  The exclusion view states the rejected content as a positive
+description, allowing the retriever to score whether a document matches that
+content.  In addition to supporting relevance, the affirmative score provides
+a reference for the topical component shared with the exclusion score.  All
+views use the same frozen scorer.
 
 Let $s(Q,d)$ denote the score assigned to document $d$ under query $Q$.  For
 each $d\in\mathcal C_u$, the three channels are
@@ -292,41 +332,47 @@ the rejected content into a directly scorable description.
 \setlength{\tabcolsep}{3pt}
 \begin{tabular}{p{0.18\linewidth} p{0.73\linewidth}}
 \toprule
-\textbf{View} & \textbf{Example text (Core17, qid\,419)} \\
+\textbf{View} & \textbf{Example text} \\
 \midrule
-$\qbase$ & What new uses have been developed for old automobile tires as a
-means of tire recycling? A relevant document must show advantageous uses of
-recycled tires, such as destructive distillation of scrap rubber for valuable
-chemicals, reef building for fish habitats, filler or binder in asphalt roadway
-mixes, and burning in a controlled environment for heat generation. Exclude any
-references of rubber. \\
-$\qpos$ & New uses for old automobile tires in recycling including
-destructive distillation, reef building, asphalt filler, and controlled
-burning for heat. \\
-$\qneg$ & rubber \\
+$\qbase$ & Find evidence that a US college education improves employment
+prospects or income. Exclude documents about colleges in Manhattan, such as
+Columbia University. \\
+$\qpos$ & Evidence that a US college education improves employment prospects
+or income. \\
+$\qneg$ & Colleges in Manhattan, such as Columbia University. \\
 \bottomrule
 \end{tabular}
-\caption{Generated views for Core17 qid\,419.  $\qbase$ is the complete
-request; $\qpos$ and $\qneg$ are produced by one LLM decomposition.}
+\caption{Evidence views for the running example in
+Figure~\ref{fig:trix-overview}.  The affirmative view states the desired
+evidence, while the exclusion view states the content to be excluded.}
 \label{tab:trix-decomposition}
 \end{table}
 
-\subsection{Residual Exclusion Score}
+\subsection{Residual Exclusion Scoring}
+\label{sec:residual-score}
 
-The raw exclusion score mixes exclusion-specific evidence with topical
-similarity shared by the affirmative and exclusion views.  For example, when
-the desired topic is genetically engineered food and the exclusion is the
-Flavr Savr tomato, a relevant document about genetically engineered soybeans
-can score highly under both views because both concern the broader topic.
-Directly subtracting the exclusion score penalizes this shared topical
-component together with evidence specific to the excluded content.
+Stage 2 in Figure~\ref{fig:trix-overview} uses the residual as a query-local
+proxy for exclusion evidence beyond topical match.  This avoids strongly
+penalizing candidates whose exclusion scores are high only because they closely
+match the topic.  In the score plot, the fitted line represents the exclusion
+score expected from a candidate's affirmative score.  The fifth, relevant
+candidate has high scores in both views but lies close to the fitted line,
+indicating that its exclusion score is expected from the shared college
+background.  The highlighted orange candidate lies farther above the line and
+therefore produces a larger positive residual, indicating additional evidence
+that it matches the excluded Manhattan colleges.
 
-\method separates the two components by measuring whether a document's
-exclusion score is unusually high given its affirmative score.  For each
-request, it fits an affine relation between the normalized affirmative and
-exclusion scores over $\mathcal C_u$.  The standardized signed deviation from
-this relation defines the residual exclusion score.  Fitting the relation per
-request adapts the reference to the score geometry induced by each instruction.
+\method addresses this ambiguity by estimating how much exclusion similarity
+is expected from the affirmative score and using the deviation from this
+relation as an exclusion proxy.  Because all candidates in $\mathcal C_u$
+are retrieved for the same request, the two scores can rise together when both
+respond to the shared topic.  An affine fit provides a simple per-request
+estimate of this score dependence.  The intercept captures a common offset, and
+the slope captures how the exclusion score changes with the affirmative score.
+If the two score channels have no systematic relation, the estimated slope is
+expected to be near zero.  The fitted value then becomes approximately
+constant, so the standardized residual reduces to the normalized exclusion
+score up to centering and scaling.
 
 \method first robustly standardizes all three score channels over the retrieved
 set $\mathcal C_u$:
@@ -351,7 +397,10 @@ Huber regression:
 where $\rho_\delta$ is the Huber loss with transition point $\delta$.  The fit
 captures the dominant score association, while the Huber loss limits the
 influence of large deviations \cite{huber1964robust}.  It provides a
-query-specific score-space reference for exclusion similarity.
+query-specific reference for exclusion similarity.  If
+the unnormalized positive-score channel has
+$\operatorname{MAD}(S_{\mathrm{pos}})<\epsilon$, we set $\hat b_u=0$ and use
+a constant fitted value.
 For $e(d)=z_{\mathrm{neg}}(d)-\hat a_u-\hat b_u z_{\mathrm{pos}}(d)$,
 we robustly standardize the residual:
 \begin{equation}
@@ -365,15 +414,22 @@ relative to the within-request residual dispersion.  This common scale allows
 the same decision parameters to be used across queries and retrievers.
 Positive $r(d)$ indicates more exclusion similarity than predicted by the
 document's affirmative score; negative $r(d)$ indicates less.  The residual is
-a relative score-space signal, not a calibrated probability of constraint
-violation.  Numerical details are given in
+a relative score-space proxy, not a calibrated probability of constraint
+violation.  As detailed in the next stage, a residual value above the shared
+boundary reduces the affirmative reward and activates an exclusion penalty.
+Numerical details are given in
 Appendix~\ref{app:implementation}.
 
-\subsection{Residual-Guided Asymmetric Scoring}
+\subsection{Relevance Promotion and Exclusion Suppression}
+\label{sec:asymmetric-scoring}
 
-\method uses the residual signal to regulate affirmative support and suppress
-strong exclusion matches.  We first retain the positive part of the normalized
-affirmative score:
+Stage 3 in Figure~\ref{fig:trix-overview} uses the residual proxy to control
+the final score correction.  Candidates with strong affirmative support and a
+small residual retain a positive correction, while candidates with a large
+positive residual lose this support and receive a
+penalty.  This raises relevant candidates and pushes the two initially
+top-ranked but excluded documents downward.  We implement this correction by
+first retaining the positive part of the normalized affirmative score:
 \begin{equation}
  p(d)=[z_{\mathrm{pos}}(d)]_+.
  \label{eq:trix-positive}
@@ -386,18 +442,21 @@ exclusion correction beyond a shared boundary $\lambda\geq0$:
  g(d)=\exp\!\left(-\frac{h(d)}{\tau}\right),\quad \tau>0,
  \label{eq:trix-attenuation}
 \end{equation}
-where $h(d)$ is the active exclusion evidence and $g(d)\in(0,1]$ is its
-attenuation factor.  Below the boundary, $h(d)=0$ and $g(d)=1$; above it,
-$h(d)$ grows linearly while $g(d)$ decreases smoothly.
+where $h(d)$ is the positive residual excess above the boundary and
+$g(d)\in(0,1]$ is the reward attenuation factor.  Below the boundary,
+$h(d)=0$ and $g(d)=1$; above it, $h(d)$ grows linearly while $g(d)$ decreases
+smoothly.
 The final score is
 \begin{equation}
  \sfinal(d)=z_{\mathrm{full}}(d)+p(d)g(d)-h(d).
  \label{eq:trix-final}
 \end{equation}
-The term $p(d)g(d)$ retains the affirmative reward under weak exclusion
-evidence and attenuates it once the boundary is crossed.  The term $-h(d)$
-directly suppresses strong exclusion matches, so the correction can lower a
-document below its full-query score.  For fixed $z_{\mathrm{full}}(d)$ and
+The term $p(d)g(d)$ retains the affirmative reward below the residual boundary
+and attenuates it once the boundary is crossed.  The term $-h(d)$ directly
+suppresses candidates with a large positive residual, so the correction can
+lower a document below its full-query score.  All three terms use unit
+coefficients on their robust standardized scales, avoiding dataset- or
+retriever-specific scoring weights.  For fixed $z_{\mathrm{full}}(d)$ and
 $p(d)$, Eq.~\ref{eq:trix-final} is therefore non-increasing in $r(d)$.
 When no exclusion view is present, \method sets $h(d)=0$ and $g(d)=1$, reducing
 the score to $z_{\mathrm{full}}(d)+p(d)$.
@@ -412,150 +471,191 @@ the score to $z_{\mathrm{full}}(d)+p(d)$.
 \label{sec:evaluation-overview}
 
 \paragraph{Benchmarks and Metrics.}
-FollowIR \cite{DBLP:conf/naacl/WellerCMLCDLS25} is our primary benchmark for
-changed-instruction retrieval on Core17, Robust04, and News21.
-We report MAP on Core17 and Robust04, nDCG on News21, and p-MRR
-\cite{DBLP:conf/naacl/WellerCMLCDLS25} for sensitivity to instruction changes.
-We interpret relevance and p-MRR jointly because either can improve at the
-expense of the other.  We also test transfer on NegConstraint
-\cite{xu2025logical}, using MAP and nDCG@10, and ExcluIR
-\cite{DBLP:conf/aaai/ZhangZ0PRRCR25}, using MRR and Right Rank (RR).  RR is the
-percentage of desired--excluded document pairs ordered correctly.  ExcluIR is
-used only for evaluation.
+FollowIR \cite{DBLP:conf/naacl/WellerCMLCDLS25} measures
+instruction-following retrieval on Core17, Robust04, and News21.  We report
+aggregate retrieval effectiveness (Score) and p-MRR for instruction
+sensitivity.  For documents whose relevance labels differ between paired
+instructions, p-MRR measures whether their reciprocal ranks move in the
+required direction; positive, zero, and negative values indicate correct, no,
+and incorrect rank changes, respectively.  NegConstraint
+\cite{xu2025logical} and ExcluIR
+\cite{DBLP:conf/aaai/ZhangZ0PRRCR25} evaluate exclusion-aware retrieval in two
+settings.  NegConstraint ranks a corpus and reports MAP and nDCG@10.  ExcluIR
+compares desired--excluded document pairs using MRR and
+Right Rank (RR), the percentage of pairs ordered correctly.
+We further use eight datasets from BEIR \cite{beir2021} to measure whether
+\method{} preserves standard retrieval effectiveness, reporting nDCG@10 and
+MAP@100.
 
-\paragraph{Models and Evaluation Protocol.}
+\paragraph{Models and Settings.}
 The frozen Qwen3-4B model \cite{yang2025qwen3} produces $\qpos$ and $\qneg$ in
-one structured generation; $\qbase$ remains the original request and retrieves
-the candidates.  FollowIR experiments use BM25
-\cite{DBLP:journals/ftir/RobertsonZ09} together with the frozen E5-Mistral,
-BGE-large, and RepLLaMA bi-encoders
-\cite{DBLP:conf/acl/WangYHYMW24,DBLP:conf/sigir/XiaoLZMLN24,DBLP:conf/sigir/MaWYWL24}
-and rerank each backbone's top-$K$ candidates, where
-$K=\textnormal{TBD}$.  NegConstraint and ExcluIR use BGE-small-en-v1.5,
-BGE-large-en-v1.5, and BGE-M3 \cite{DBLP:conf/sigir/XiaoLZMLN24}.
+one structured generation on a single NVIDIA GeForce RTX 3090 GPU with
+temperature $0.1$; $\qbase$ remains the original request and retrieves the
+candidates.  FollowIR experiments use BM25
+\cite{DBLP:journals/ftir/RobertsonZ09} together with the frozen E5-Mistral
+\cite{DBLP:conf/acl/WangYHYMW24}, BGE-large
+\cite{DBLP:conf/sigir/XiaoLZMLN24}, and RepLLaMA
+\cite{DBLP:conf/sigir/MaWYWL24} bi-encoders.  NegConstraint and ExcluIR use
+BGE-small-en-v1.5, BGE-large-en-v1.5, BGE-M3
+\cite{DBLP:conf/sigir/XiaoLZMLN24}, and RepLLaMA.
+FollowIR, NegConstraint, and BEIR use
+$K_{\mathrm{retrieve}}=K_{\mathrm{fit}}=K_{\mathrm{rerank}}=1000$: $\qbase$
+retrieves 1,000 candidates, which form $\mathcal C_u$ for normalization, Huber
+fitting, and reranking.  ExcluIR uses its full 90,406-document corpus because
+some annotated excluded documents initially rank near 9,000; this protocol
+keeps both documents available for every evaluated pair.
 Within every matched comparison, variants share candidates, generated views,
 retrieval templates, scorer configuration, and document representations.
-The same $\lambda=\textnormal{TBD}$ and $\tau=\textnormal{TBD}$ are fixed
-without test relevance labels and used across datasets and retrievers.
-Prompt, decoding, normalization, and numerical details are provided in
-Appendix~\ref{app:implementation}.
+The same $\lambda{=}0.5$ and $\tau{=}0.1$ are fixed without test relevance
+labels and used across datasets and retrievers.  Appendix
+Table~\ref{tab:sensitivity-efficiency} reproduces the main FollowIR depth of
+1,000 and reports its matched depth sensitivity analysis; this sweep does not
+alter the full-corpus ExcluIR protocol.  Prompt, decoding, normalization, and
+numerical details are provided in Appendix~\ref{app:implementation}.
 
 \paragraph{Baselines and Controlled Comparisons.}
-On FollowIR, FollowIR-7B, Promptriever, and InstEmb
-\cite{DBLP:conf/naacl/WellerCMLCDLS25,DBLP:conf/iclr/WellerDLPZH25,gao2026instemb}
-provide instruction-trained system-level references.  We also reproduce
-HyDE, Query2Doc, and ConvSearch-R1 with RepLLaMA
-\cite{DBLP:conf/acl/GaoMLC23,DBLP:conf/emnlp/WangYW23,
-DBLP:journals/corr/abs-2503-00223}.
-Per-collection comparisons are reported in
-Appendix~\ref{app:followir-full}.  DEO
-\cite{DBLP:journals/corr/abs-2603-09185} and the strongest results reported
-with NegConstraint and ExcluIR provide system-level context.  We report these
-separately from the matched Base/$+\method$ comparisons because their training
-and retrieval pipelines differ.  Paired uncertainty for the central component
-comparisons is reported in Appendix~\ref{app:statistical-reliability}.
+On FollowIR, FollowIR-7B \cite{DBLP:conf/naacl/WellerCMLCDLS25},
+Promptriever \cite{DBLP:conf/iclr/WellerDLPZH25}, and InstEmb
+\cite{gao2026instemb} are included as instruction-trained baselines.
+We also reproduce HyDE \cite{DBLP:conf/acl/GaoMLC23}, Query2Doc
+\cite{DBLP:conf/emnlp/WangYW23}, and ConvSearch-R1
+\cite{DBLP:journals/corr/abs-2503-00223} with RepLLaMA.
+Their aggregate comparison is reported in
+Section~\ref{sec:rewrite-comparison}.  On the exclusion benchmarks, NS-IR
+\cite{xu2025logical}, DEO
+\cite{DBLP:journals/corr/abs-2603-09185}, and SEAL
+\cite{DBLP:conf/aaai/ZhangZ0PRRCR25} are included as prior methods.  Their
+results are separated from the matched Base/$+\method$ comparisons because
+their training and retrieval pipelines differ.
 
 \subsection{Main Results on Instruction-Following Retrieval}
 \label{sec:main-results}
 
-Table~\ref{tab:followir-main} tests whether \method improves both relevance and
-instruction sensitivity across frozen retrievers.  The lower block contains
-matched Base/$+\method$ pairs spanning BM25 and three dense retriever families;
-the upper block provides instruction-trained system-level references.
-
-\begin{table*}[t]
-\caption{FollowIR results.  Published instruction-trained results follow their
-source papers
-\cite{DBLP:conf/naacl/WellerCMLCDLS25,DBLP:conf/iclr/WellerDLPZH25,gao2026instemb}.
-Each lower-block \method row is matched to the backbone above it.  Score
-averages MAP on Core17 and Robust04 with nDCG on News21.  Values are
-percentages ($\times100$).}
-\label{tab:followir-main}
-\centering
-\scriptsize
-\setlength{\tabcolsep}{3.4pt}
-\begin{tabular}{lcccccccc}
-\toprule
-& \multicolumn{2}{c}{Core17} & \multicolumn{2}{c}{Robust04} &
-\multicolumn{2}{c}{News21} & \multicolumn{2}{c}{Average} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
-\textbf{Method} & MAP & p-MRR & MAP & p-MRR & nDCG & p-MRR & Score & p-MRR \\
-\midrule
-\multicolumn{9}{l}{\emph{Instruction-trained retrievers}} \\
-FollowIR-7B & 20.0 & +16.5 & 24.8 & +13.7 & 29.6 & +6.3 & 24.8 & +12.2 \\
-Promptriever & 21.6 & +15.4 & 28.3 & +11.7 & 28.5 & +6.4 & 26.1 & +11.2 \\
-InstEmb (Llama-3-8B) & 24.0 & +22.4 & 29.2 & +19.1 & 32.3 & +5.4 & 28.5 & +15.6 \\
-\midrule
-\multicolumn{9}{l}{\emph{Matched retrieval-backbone comparisons}} \\
-BM25 & 10.8 & +3.7 &
-13.8 & $-$0.5 & 21.0 & 0.0 &
-15.2 & +1.1 \\
-\quad + \method{} & 13.2 & +18.4 &
-14.0 & +13.8 & 24.8 & +20.3 &
-17.3 & +17.5 \\
-\addlinespace[2pt]
-E5-Mistral & 20.4 & $-$0.3 &
-27.9 & $-$6.9 & 30.1 & $-$0.9 &
-26.1 & $-$2.7 \\
-\quad + \method{} & 24.4 & +5.7 &
-26.7 & +19.6 & 32.8 & +11.1 &
-28.0 & +12.1 \\
-\addlinespace[2pt]
-BGE-large & 16.8 & $-$2.0 &
-19.4 & $-$5.2 & 21.4 & +0.5 &
-19.2 & $-$2.2 \\
-\quad + \method{} & 21.2 & $+$4.3 &
-19.8 & +9.0 & 25.1 & +6.3 &
-22.0 & +6.5 \\
-\addlinespace[2pt]
-RepLLaMA & 23.2 & +1.1 & 25.7 & $-$9.1 & 22.5 & $-$1.8 & 23.8 & $-$3.3 \\
-\quad + \method{} & 25.6 & +16.2 & 27.9 & +14.1 & 31.8 & +6.8 & 28.4 & +12.3 \\
-\bottomrule
-\end{tabular}
-\end{table*}
-
-The matched comparisons show that retrieval effectiveness alone does not imply
-instruction sensitivity.  Before reranking, three dense backbones have
-negative average p-MRR despite competitive relevance scores.  Adding \method
-makes average p-MRR positive for all four backbones and also raises their
-average relevance scores.  The gains hold from BM25 to three dense retrievers:
-for RepLLaMA, \method raises the average Score from 23.8 to 28.4 and p-MRR from
-$-3.3$ to $+12.3$.  Because the matched rows keep retrieval outputs and
-document representations fixed, these comparisons isolate reranking within
-each backbone's candidate set.
-
-\paragraph{Comparison with Query Rewriting and Expansion.}
-The RepLLaMA comparison in Appendix~\ref{app:followir-full} separates topical
-expansion from instruction-aware reranking.  Query2Doc obtains the strongest
-average relevance score among the representative rewriting pipelines (26.2)
-but has negative p-MRR ($-1.1$); \method reaches 28.4 and $+12.3$,
-respectively.  This pipeline-level comparison indicates that adding relevant
-query content is insufficient to ensure responsiveness to changed relevance
-criteria.  The matched ablations below isolate the contribution of \method's
-scoring components.
-
-\subsection{Transfer Across Exclusion Benchmarks}
-\label{sec:exclusion-transfer}
-
-Table~\ref{tab:exclusion-transfer} tests whether the same reranking rule
-transfers from FollowIR to two explicit-exclusion settings.  NegConstraint
-\cite{xu2025logical} evaluates compositional constraints over a ranked corpus;
-ExcluIR \cite{DBLP:conf/aaai/ZhangZ0PRRCR25} evaluates naturally phrased
-exclusions using desired--excluded document pairs.
+Table~\ref{tab:followir-main} reports aggregate FollowIR results.  The lower
+block contains matched Base/$+\method$ pairs spanning BM25 and three dense
+retriever families; the upper block reports instruction-trained retrievers.
+Per-dataset results are reported in
+Appendix~\ref{app:followir-breakdown}.
 
 \begin{table}[t]
-\caption{Transfer across exclusion-retrieval benchmarks.  Each $+\method$ row
-is matched to the Base backbone above it with the same candidates and document
-representations.  Published DEO and SEAL values follow
-\citet{DBLP:journals/corr/abs-2603-09185} and
-\citet{DBLP:conf/aaai/ZhangZ0PRRCR25}; SEAL uses ExcluIR training, while
-\method uses only its evaluation set.  BGE-S/L denote
-BGE-small/large-en-v1.5.  Values are percentages ($\times100$).}
-\label{tab:exclusion-transfer}
 \centering
-\scriptsize
-\setlength{\tabcolsep}{2.3pt}
-\begin{tabular}{lcccc}
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Score} & \textbf{p-MRR} \\
+\midrule
+\multicolumn{3}{l}{\emph{Instruction-trained retrievers}} \\
+FollowIR-7B & 24.8 & +12.2 \\
+Promptriever & 26.1 & +11.2 \\
+InstEmb (Llama-3-8B) & \textbf{28.5} & \textbf{+15.6} \\
+\midrule
+\multicolumn{3}{l}{\emph{Matched frozen-backbone comparisons}} \\
+BM25 & 15.2 & +1.1 \\
+\quad $+\method$ & 17.3 & \textbf{+17.5} \\
+\addlinespace[2pt]
+E5-Mistral & 26.1 & $-$2.7 \\
+\quad $+\method$ & 28.0 & +12.1 \\
+\addlinespace[2pt]
+BGE-large & 19.2 & $-$2.2 \\
+\quad $+\method$ & 23.3 & +6.5 \\
+\addlinespace[2pt]
+RepLLaMA & 23.8 & $-$3.3 \\
+\quad $+\method$ & \textbf{28.7} & +12.3 \\
+\bottomrule
+\end{tabular}
+\caption{Aggregate FollowIR results.  Score averages MAP on Core17 and
+Robust04 with nDCG on News21.  Each $+\method$ row is matched to the backbone
+above it; values are percentages ($\times100$).  Best results within each
+comparable block are shown in bold.}
+\label{tab:followir-main}
+\end{table}
+
+\method improves both retrieval effectiveness and instruction sensitivity for
+every frozen backbone, spanning BM25 and three dense retrievers.  Before
+reranking, the three dense backbones have negative average p-MRR, indicating
+that their rankings often fail to follow the relevance instruction.  \method
+makes p-MRR positive while also raising Score; with RepLLaMA, Score increases
+from 23.8 to 28.7 and p-MRR from $-3.3$ to $+12.3$.  Each
+Base/$+\method$ pair ranks the same candidates with the same document
+representations; \method only corrects their scores.
+
+\paragraph{Comparison with Query Rewriting and Expansion.}
+\label{sec:rewrite-comparison}
+Table~\ref{tab:followir-full} compares \method{} with representative
+inference-time rewriting and expansion methods using RepLLaMA.  Each method
+uses its original query-generation and retrieval procedure.  Results for
+Core17, Robust04, and News21 are provided in Appendix
+Table~\ref{tab:rewrite-breakdown}.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Score} & \textbf{p-MRR} \\
+\midrule
+RepLLaMA & 23.8 & $-$3.3 \\
+HyDE & 23.4 & +1.4 \\
+Query2Doc & 25.6 & $-$1.1 \\
+ConvSearch-R1 & 23.4 & +0.2 \\
+\method{} & \textbf{28.7} & \textbf{+12.3} \\
+\bottomrule
+\end{tabular}
+\caption{Aggregate FollowIR comparison with query rewriting and expansion
+using RepLLaMA.  Score averages MAP on Core17 and Robust04 with nDCG on
+News21; values are percentages ($\times100$).  Best results are shown in
+bold.}
+\label{tab:followir-full}
+\end{table}
+
+\method{} outperforms all compared rewriting and expansion methods on both
+aggregate metrics, reaching 28.7 Score and $+12.3$ p-MRR.  Existing rewriting
+methods are mainly designed to make the target topic easier to match.  For
+example, HyDE generates a hypothetical relevant document, while Query2Doc
+expands the query with a generated pseudo-document.  Both add positive topical
+context, but neither represents excluded content as evidence that should lower
+a document's rank.  Excluded entities can therefore remain strong lexical or
+semantic matching signals after rewriting.  \method{} separates
+affirmative and exclusion evidence before correcting the ranking scores. 
+
+\subsection{Evaluation on Exclusion-Aware Benchmarks}
+\label{sec:exclusion-transfer}
+
+We evaluate \method{} on two benchmarks designed for retrieval with negative
+constraints.  NegConstraint \cite{xu2025logical} evaluates compositional
+constraints over a ranked corpus, while ExcluIR
+\cite{DBLP:conf/aaai/ZhangZ0PRRCR25} compares desired and excluded documents in
+pairs.
+
+NegConstraint reranks the top 1,000 full-query candidates.  ExcluIR scores the
+complete 90,406-document corpus with all three views and uses this pool for
+normalization, Huber fitting, and reranking.  The full pool covers annotated
+excluded documents that initially rank near 9,000.  Regression uses only
+retrieval scores and no pair labels.  MRR and RR are computed from the
+resulting full rankings under the protocol detailed in
+Appendix~\ref{app:exclusion-benchmarks}.
+
+\method improves both metrics for every matched backbone on both benchmarks.
+The gains hold across the three BGE models and RepLLaMA, showing that the same
+reranking rule is effective across different retrievers and in both corpus
+ranking and pairwise comparison.  RepLLaMA provides the strongest overall
+results: \method raises its
+MAP from 72.8 to 80.0 and nDCG@10 from 79.4 to 84.8 on NegConstraint, while
+improving MRR from 75.9 to 87.2 and RR from 62.1 to 89.9 on ExcluIR.
+
+Compared with prior methods, RepLLaMA with \method obtains higher results than
+DEO on both benchmarks and SEAL on ExcluIR.  These methods use different
+training and retrieval pipelines, so the results are not controlled
+comparisons.  Appendix~\ref{app:exclusion-benchmarks} compares raw exclusion
+scoring with residual scoring on both benchmarks.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
 \multirow{2}{*}{\textbf{Backbone / Method}} &
 \multicolumn{2}{c}{\textbf{NegConstraint}} &
@@ -563,17 +663,18 @@ BGE-small/large-en-v1.5.  Values are percentages ($\times100$).}
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 & \textbf{MAP} & \textbf{nDCG@10} & \textbf{MRR} & \textbf{RR} \\
 \midrule
-\multicolumn{5}{l}{\emph{Published system-level references}} \\
-DEO (BGE-L) & 73.3 & 78.8 & --- & --- \\
-SEAL + ExcluIR training & --- & --- & 78.4 & 78.0 \\
+\multicolumn{5}{l}{\emph{Prior methods}} \\
+NS-IR (GPT-4o) & 53.3 & 56.5 & --- & --- \\
+DEO (BGE-large) & \textbf{73.3} & \textbf{78.8} & 74.1 & \textbf{79.3} \\
+SEAL (trained) & --- & --- & \textbf{78.4} & 78.0 \\
 \midrule
 \multicolumn{5}{l}{\emph{Matched frozen-backbone comparisons}} \\
-BGE-S & 68.4 & 75.2 &
+BGE-small & 68.4 & 75.2 &
 75.0 & 60.1 \\
 \quad $+\method$ & 76.9 & 82.3 &
 77.1 & 81.3 \\
 \addlinespace[2pt]
-BGE-L & 63.8 & 71.9 &
+BGE-large & 63.8 & 71.9 &
 73.4 & 56.0 \\
 \quad $+\method$ & 76.6 & 81.8 &
 78.2 & 82.2 \\
@@ -582,45 +683,66 @@ BGE-M3 & 64.3 & 74.1 &
 78.9 & 67.0 \\
 \quad $+\method$ & 74.7 & 81.1 &
 79.7 & 83.7 \\
+\addlinespace[2pt]
+RepLLaMA & 72.8 & 79.4 &
+75.9 & 62.1 \\
+\quad $+\method$ & \textbf{80.0} & \textbf{84.8} &
+\textbf{87.2} & \textbf{89.9} \\
 \bottomrule
 \end{tabular}
+\caption{Results on NegConstraint and ExcluIR.  NegConstraint uses top-1,000
+candidates, whereas ExcluIR scores its full 90,406-document corpus.  Each
+$+\method$ row uses the same candidate pool and document representations as
+its base; values are percentages ($\times100$).  Best results within each
+comparable block are shown in bold.}
+\label{tab:exclusion-transfer}
 \end{table}
 
-\method improves both metrics for every matched backbone on both benchmarks.
-On NegConstraint, MAP increases by 8.5--12.8 points and nDCG@10 by
-7.0--9.9 points.  On ExcluIR, MRR increases by 0.8--4.8 points and RR by
-16.7--26.2 points.  These consistent matched gains show that the same
-formulation operates across different retriever geometries and exclusion
-protocols.
+\subsection{General Retrieval Performance}
+\label{sec:beir-preservation}
 
-The published rows provide system-level context.  BGE-large with \method
-exceeds the separately reported DEO result by 3.3 MAP and 3.0 nDCG@10 points
-on NegConstraint.  On ExcluIR, it reaches 82.2 RR, compared with 78.0 for SEAL,
-which uses benchmark-specific training.  The matched signal-level comparison
-in Appendix~\ref{app:exclusion-benchmarks} examines residual correction under
-the two evaluation protocols.
+We use eight BEIR datasets to measure general retrieval performance.
+Table~\ref{tab:beir-main} reports aggregate results with BGE-large; the
+per-dataset breakdown is provided in Appendix~\ref{app:beir}.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Avg.\ nDCG@10} & \textbf{Avg.\ MAP@100} \\
+\midrule
+BGE-large & 60.03 & 44.23 \\
+\quad $+\method$ & 60.22 & 44.19 \\
+\bottomrule
+\end{tabular}
+\caption{General retrieval performance on eight BEIR datasets with BGE-large.
+\method{} maintains average retrieval effectiveness, with changes of $+0.19$
+nDCG@10 and $-0.04$ MAP@100; values are percentages ($\times100$).}
+\label{tab:beir-main}
+\end{table}
+
+\method{} maintains general retrieval performance across the eight BEIR
+datasets.  Average nDCG@10 improves from 60.03 to 60.22, while MAP@100 remains
+nearly unchanged (44.23 versus 44.19), corresponding to changes of $+0.19$ and
+$-0.04$ points, respectively.
 
 \subsection{Ablation Study}
 \label{sec:ablation-study}
 
-Table~\ref{tab:ablation-residual} tests three questions: whether the affirmative
-view adds useful relevance evidence, whether residualization improves the
-exclusion signal, and whether attenuation and direct suppression are both
-needed in the final score.  Here $p$, $r$, $h$, and $g$ denote the positive
-score, residual exclusion score, thresholded exclusion penalty, and attenuation
-factor defined in Section~\ref{sec:method}.  All variants use the same
+Table~\ref{tab:ablation-residual} organizes the ablation around three design
+steps: evidence view construction, residual exclusion scoring, and final score
+correction.  Here $p$, $r$, $h$, and $g$ denote the positive score, residual
+exclusion score, thresholded exclusion penalty, and reward attenuation factor
+defined in Section~\ref{sec:method}.  All variants use the same
 candidates, generated views, frozen encoder, templates, embeddings, and
 hyperparameters.
 
 \begin{table}[t]
-\caption{Controlled mechanism ablation on FollowIR.  The three blocks isolate
-evidence construction, exclusion-signal construction, and the two operations
-in \method score composition.  Score averages MAP on Core17 and Robust04 with
-nDCG on News21; all values are percentages ($\times100$).}
-\label{tab:ablation-residual}
 \centering
-\scriptsize
-\setlength{\tabcolsep}{3pt}
+\small
+\setlength{\tabcolsep}{2pt}
 \begin{tabular}{lccc}
 \toprule
 \textbf{Variant} & \textbf{Decision score} & \textbf{Score} & \textbf{p-MRR} \\
@@ -628,33 +750,55 @@ nDCG on News21; all values are percentages ($\times100$).}
 \multicolumn{4}{l}{\emph{Evidence construction}} \\
 Full-query baseline & $z_{\mathrm{full}}$ & 23.8 & $-$3.3 \\
 Positive-view scoring & $z_{\mathrm{full}}+p$ & 25.5 & $-$0.7 \\
+Exclusion-view subtraction & $z_{\mathrm{full}}-z_{\mathrm{neg}}$ & 25.8 & +7.6 \\
 \midrule
 \multicolumn{4}{l}{\emph{Exclusion-signal construction}} \\
 Raw exclusion subtraction & $z_{\mathrm{full}}+p-z_{\mathrm{neg}}$ & 24.0 & +14.9 \\
 Residual exclusion subtraction & $z_{\mathrm{full}}+p-r$ & 26.6 & +12.7 \\
 \midrule
 \multicolumn{4}{l}{\emph{\method score composition}} \\
-\method w/o reward attenuation & $z_{\mathrm{full}}+p-h$ & \textnormal{26.3} & \textnormal{10.8} \\
-\method w/o exclusion penalty & $z_{\mathrm{full}}+pg$ & \textnormal{26.4} & \textnormal{8.9} \\
-Full \method & $z_{\mathrm{full}}+pg-h$ & 28.4 & +12.3 \\
+\method w/o reward attenuation & $z_{\mathrm{full}}+p-h$ & 26.3 & +10.8 \\
+\method w/o exclusion penalty & $z_{\mathrm{full}}+pg$ & 26.9 & +8.9 \\
+Full \method & $z_{\mathrm{full}}+pg-h$ & \textbf{28.7} & \textbf{+12.3} \\
 \bottomrule
 \end{tabular}
+\caption{Controlled mechanism ablation on FollowIR.  The three blocks isolate
+evidence construction, exclusion-signal construction, and the two operations
+in \method score composition.  Score averages MAP on Core17 and Robust04 with
+nDCG on News21; all values are percentages ($\times100$).  Results for the
+full system are shown in bold.}
+\label{tab:ablation-residual}
 \end{table}
-\FloatBarrier
 
+\paragraph{Evidence Views.}
 The focused positive view raises Score from 23.8 to 25.5 and p-MRR from
 $-3.3$ to $-0.7$, confirming that it contributes evidence beyond the full
-instruction.  Under the same subtraction rule, replacing raw exclusion
-similarity with the residual recovers 2.6 Score points while retaining strongly
-positive p-MRR (12.7 versus 14.9).  Residualization therefore reduces the
-relevance loss caused by direct exclusion subtraction, with a modest decrease
-in instruction sensitivity.
+instruction.  The exclusion view also contributes independently: subtracting
+its score raises Score to 25.8 and p-MRR to $+7.6$.  The two views therefore
+provide complementary signals for relevance promotion and exclusion
+suppression.
 
-The final block tests how the residual enters the ranking score.  Full \method
-improves over the variant without reward attenuation by 2.1 Score and 1.5
+\paragraph{Residual Exclusion Evidence.}
+Under the same subtraction rule, replacing raw exclusion similarity with the
+residual recovers 2.6 Score points while retaining strongly positive p-MRR
+(12.7 versus 14.9).  Raw subtraction causes large downward rank shifts for
+many documents with high exclusion scores.  This produces high p-MRR because
+more documents are demoted and move farther down the ranking.  A high
+exclusion score, however, does not necessarily indicate excluded content:
+some documents that satisfy the instruction also receive high exclusion
+scores because they closely match its topic.  Direct subtraction
+over-penalizes these documents and limits Score to
+24.0.  The residual provides a query-local proxy for exclusion evidence beyond
+topical match, reducing the over-penalization of documents that satisfy the
+instruction.  It raises Score to 26.6 while retaining a positive p-MRR of
+12.7.
+
+\paragraph{Score Correction.}
+Full \method
+improves over the variant without reward attenuation by 2.4 Score and 1.5
 p-MRR points, showing that strong residual evidence should also reduce the
 positive contribution.  Adding the explicit penalty to the attenuation-only
-variant yields gains of 2.0 Score and 3.4 p-MRR points.  Together, the two
+variant yields gains of 1.8 Score and 3.4 p-MRR points.  Together, the two
 comparisons support the asymmetric combination of attenuating affirmative
 support and directly suppressing strong exclusion matches.
 
@@ -662,17 +806,17 @@ support and directly suppressing strong exclusion matches.
 \label{sec:mechanism-analysis}
 
 \paragraph{Residual Signal.}
-Figure~\ref{fig:residual-mechanism} illustrates why raw exclusion similarity is
-an imprecise suppression signal.  For this query,
-$z_{\mathrm{neg}}$ rises with $z_{\mathrm{pos}}$, so direct subtraction also
-penalizes the exclusion score predicted by affirmative relevance.  The fitted
-Huber relation estimates this shared component, and the standardized deviation
-$r$ retains candidates whose exclusion similarity is unusually high relative
-to their affirmative score.
+Figure~\ref{fig:residual-mechanism} illustrates how residualization changes
+the meaning of the exclusion score.  For this query, $z_{\mathrm{neg}}$
+increases with $z_{\mathrm{pos}}$ because the affirmative and exclusion views
+share topical information.  The fitted relation represents the exclusion
+score expected from this shared relevance.  A document close to the fitted
+relation may therefore have a high exclusion score without providing strong
+evidence that it matches the excluded content.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{Figures/figure2.pdf}
+\includegraphics[width=0.94\linewidth]{Figures/figure2_adjusted.pdf}
 \caption{Residualization for an illustrative query.  Left: the Huber relation
 between affirmative and exclusion scores.  Right: standardized deviations
 after removing the fitted component.  Positive residuals identify candidates
@@ -680,58 +824,42 @@ with more exclusion similarity than predicted by their affirmative score.}
 \label{fig:residual-mechanism}
 \end{figure}
 
-The raw-versus-residual comparison in
-Table~\ref{tab:ablation-residual} tests the ranking effect of this change; the
-cross-benchmark comparison is reported in
-Appendix~\ref{app:exclusion-benchmarks}.
+Candidates near the fitted relation receive small residuals, so high exclusion
+scores explained by topical match do not trigger a strong penalty.  Candidates
+above the relation receive positive residuals, indicating additional exclusion
+evidence beyond topical match.  This distinction explains the controlled result in
+Table~\ref{tab:ablation-residual}: replacing raw exclusion subtraction with
+the residual raises Score from 24.0 to 26.6 while retaining a strongly positive
+p-MRR of $+12.7$.  The residual reduces penalties on relevant documents whose
+raw exclusion scores are high mainly because of topic overlap.
 
-\paragraph{Effects on Ranking.}
-\method converts the residual into a document-level score adjustment.  Its
-effect relative to positive-view scoring and the full-query baseline is
-\begin{equation}
-\begin{aligned}
- \Delta_{\mathrm{pos}}(d)
- &=\sfinal(d)-\bigl(z_{\mathrm{full}}(d)+p(d)\bigr) \\
- &=p(d)\bigl(g(d)-1\bigr)-h(d),\\
- \Delta_{\mathrm{base}}(d)
- &=\sfinal(d)-z_{\mathrm{full}}(d)
- =p(d)g(d)-h(d).
-\end{aligned}
-\label{eq:trix-adjustments}
-\end{equation}
-When $r(d)\leq\lambda$, $h(d)=0$ and $g(d)=1$, so
-$\Delta_{\mathrm{pos}}(d)=0$ and $\Delta_{\mathrm{base}}(d)=p(d)\geq0$:
-the positive contribution is preserved.  Above the boundary,
-$\Delta_{\mathrm{pos}}(d)<0$; the positive contribution is attenuated as the
-exclusion penalty increases.
+\paragraph{Ranking Behavior.}
+Figure~\ref{fig:reward-penalty-effect} visualizes the document-level rank
+changes produced by \method{}.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{Figures/dual_rank_scatter_followir_repllama_v8.pdf}
-\caption{Base rank versus \method{} rank for documents from FollowIR
-exclusion queries.  Each point is a document; diamonds denote documents
-that remain relevant after the exclusion change, and circles denote
-documents excluded by the new instruction.  Points above the diagonal
-are promoted by \method; points below it are suppressed.}
+\includegraphics[width=0.85\linewidth]{Figures/dual_rank_scatter_followir_repllama_v8.pdf}
+\caption{Rank changes produced by \method{} on FollowIR exclusion queries.
+The vertical axis gives the initial rank from the frozen retriever, and the
+horizontal axis gives the rank after \method{} adds the affirmative reward and
+subtracts the exclusion penalty.  Points above the diagonal are promoted,
+points below it are suppressed, and points on the diagonal are unchanged.
+Blue diamonds denote relevant documents, while orange circles denote
+documents that violate the exclusion constraint.}
 \label{fig:reward-penalty-effect}
 \end{figure}
 
-Figure~\ref{fig:reward-penalty-effect} shows the resulting rank changes.  The
-documents that remain relevant after the instruction change tend to move above
-the diagonal, while excluded documents tend to move below it.  The separation
-is clearest among the highest-ranked documents, where changes have the largest
-effect on retrieval metrics.  This behavior agrees with
-Eq.~\ref{eq:trix-adjustments}: the affirmative term promotes relevant
-documents, while attenuation and the explicit penalty suppress strong
-exclusion matches.
-
-\FloatBarrier
-Overall, the experiments show that \method improves relevance and instruction
-sensitivity across sparse and dense retrievers, transfers to two explicit-
-exclusion benchmarks, and benefits from both residual signal construction and
-asymmetric score composition.  Estimator alternatives, sensitivity, paired
-uncertainty, and latency are reported in
-Appendix~\ref{app:additional-ablations}.
+The distribution shows how the correction acts on the two document groups.
+Relevant documents, shown as blue diamonds, are concentrated above the
+diagonal, indicating that \method{} promotes documents that should rank higher.
+Documents that violate the exclusion constraint tend to fall below the
+diagonal, indicating that the correction suppresses documents that should rank
+lower.  This separation is clearest among the highest-ranked documents, where
+rank changes have the largest effect on retrieval quality.  Together with the
+score-composition ablation in Table~\ref{tab:ablation-residual}, this pattern
+illustrates how the affirmative reward and exclusion penalty jointly produce
+the intended ranking behavior.
 
 % ============================================================
 % 5. CONCLUSION AND LIMITATIONS
@@ -739,174 +867,284 @@ Appendix~\ref{app:additional-ablations}.
 \section{Conclusion and Limitations}
 \label{sec:conclusion}
 
-This paper presented \method{}, a training-free reranking method that
-corrects the scores of a frozen retriever to better follow exclusion
-instructions.  Across three benchmarks and four retriever families,
-\method{} consistently improves instruction-sensitive ranking without
-retraining or document re-encoding.
+This paper presented \method{}, a training-free method that corrects the scores
+of a frozen retriever to better follow complex relevance instructions without
+retraining or document re-encoding.  The results support three conclusions.  First,
+separating the request into focused evidence views improves relevance scoring
+for positive criteria.  Second, residual scoring provides a query-local proxy
+for exclusion evidence beyond topical match and reduces the over-penalization
+of documents that satisfy the instruction.  Third, using this signal to attenuate affirmative
+rewards and apply exclusion penalties improves instruction-sensitive ranking
+across the matched sparse and dense frozen retrievers.  On eight BEIR datasets,
+\method maintains general retrieval effectiveness, with average changes of
+$+0.19$ nDCG@10 and $-0.04$ MAP@100 relative to BGE-large.
 
 \method relies on two conditions: the LLM decomposition must expose useful
 affirmative and exclusion views, and the initial retriever must provide
-adequate candidate coverage.  Its local affine correction may be less
-effective when these views remain tightly coupled in the retriever's score
-space.  These conditions define the intended scope of score-level correction
-and motivate future combinations with stronger decomposition and explicit
-constraint reasoning.
+adequate candidate coverage.  As a reranker, \method cannot recover relevant
+documents absent from the initial top-$K$ set.  The reported results evaluate
+score correction under full-query candidate generation; alternative
+candidate-generation strategies form a separate retrieval-stage design
+choice.  Its local affine correction may also be less effective when the two
+views remain tightly coupled in the retriever's score space.  Future work can
+combine score correction with stronger decomposition and explicit constraint
+reasoning.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+{\small
+\bibliography{references}
+}
 
 % ============================================================
 % APPENDIX
 % ============================================================
+\clearpage
 \appendix
 
-\section{Extended FollowIR Results}
-\label{app:followir-full}
+\section{Full FollowIR Results}
+\label{app:followir-breakdown}
 
-Table~\ref{tab:followir-full} gives the per-collection results for the
-RepLLaMA control, three representative rewriting or expansion pipelines, and
-\method.  All rows use the same RepLLaMA document representations, templates,
-and evaluation protocol; each rewriting pipeline retains its intended query
-and candidate-generation procedure.
+Table~\ref{tab:followir-breakdown} provides the per-dataset results
+underlying the aggregate comparison in Table~\ref{tab:followir-main}.
+Results for instruction-trained methods are taken from their source papers
+\cite{DBLP:conf/naacl/WellerCMLCDLS25,DBLP:conf/iclr/WellerDLPZH25,
+gao2026instemb}.
 
-\begin{table*}[htbp]
-\caption{Representative per-collection FollowIR results with RepLLaMA.
-Rewriting pipelines retain their intended query and candidate-generation
-procedures.  All metrics are percentages ($\times100$).}
-\label{tab:followir-full}
+\begin{table}[htbp]
 \centering
 \small
-\begin{tabular}{lcccccccc}
+\setlength{\tabcolsep}{3.2pt}
+\textit{(a) Retrieval effectiveness}\par\smallskip
+\begin{tabular}{lcccc}
 \toprule
-& \multicolumn{2}{c}{Core17} & \multicolumn{2}{c}{Robust04} & \multicolumn{2}{c}{News21} & \multicolumn{2}{c}{Average} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
-\textbf{Method} & MAP & p-MRR & MAP & p-MRR & nDCG & p-MRR & Score & p-MRR \\
+\textbf{Method} & \textbf{Core17} & \textbf{Robust04} &
+\textbf{News21} & \textbf{Score} \\
 \midrule
-\multicolumn{9}{l}{\emph{Matched RepLLaMA evaluation}} \\
-RepLLaMA & 23.2 & +1.1 & 25.7 & $-$9.1 & 22.5 & $-$1.8 & 23.8 & $-$3.3 \\
-HyDE & 23.6 & +6.5 & 24.9 & -2.9 & 21.4 & +0.7 & 23.4 & +1.4 \\
-Query2Doc & 25.9 & +8.0 & 27.9 & -7.5 & 24.9 & -3.8 & 26.2 & -1.1 \\
-ConvSearch-R1 & 22.3 & +3.0 & 25.9 & -2.5 & 22.0 & +0.2 & 23.4 & +0.2 \\
-\method{} & 25.6 & +16.2 & 27.9 & +14.1 & 31.8 & +6.8 & 28.4 & +12.3 \\
+\multicolumn{5}{l}{\emph{Instruction-trained retrievers}} \\
+FollowIR-7B & 20.0 & 24.8 & 29.6 & 24.8 \\
+Promptriever & 21.6 & 28.3 & 28.5 & 26.1 \\
+InstEmb (Llama-3-8B) & 24.0 & 29.2 & 32.3 & 28.5 \\
+\midrule
+\multicolumn{5}{l}{\emph{Matched frozen-backbone comparisons}} \\
+BM25 & 10.8 & 13.8 & 21.0 & 15.2 \\
+\quad $+\method$ & 13.2 & 14.0 & 24.8 & 17.3 \\
+E5-Mistral & 20.4 & 27.9 & 30.1 & 26.1 \\
+\quad $+\method$ & 24.4 & 26.7 & 32.8 & 28.0 \\
+BGE-large & 16.8 & 19.4 & 21.4 & 19.2 \\
+\quad $+\method$ & 22.1 & 21.9 & 26.0 & 23.3 \\
+RepLLaMA & 23.2 & 25.7 & 22.5 & 23.8 \\
+\quad $+\method$ & 25.9 & 28.2 & 32.1 & 28.7 \\
 \bottomrule
 \end{tabular}
-\end{table*}
+
+\smallskip
+\textit{(b) Instruction sensitivity (p-MRR)}\par\smallskip
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Core17} & \textbf{Robust04} &
+\textbf{News21} & \textbf{Average} \\
+\midrule
+\multicolumn{5}{l}{\emph{Instruction-trained retrievers}} \\
+FollowIR-7B & +16.5 & +13.7 & +6.3 & +12.2 \\
+Promptriever & +15.4 & +11.7 & +6.4 & +11.2 \\
+InstEmb (Llama-3-8B) & +22.4 & +19.1 & +5.4 & +15.6 \\
+\midrule
+\multicolumn{5}{l}{\emph{Matched frozen-backbone comparisons}} \\
+BM25 & +3.7 & $-$0.5 & 0.0 & +1.1 \\
+\quad $+\method$ & +18.4 & +13.8 & +20.3 & +17.5 \\
+E5-Mistral & $-$0.3 & $-$6.9 & $-$0.9 & $-$2.7 \\
+\quad $+\method$ & +5.7 & +19.6 & +11.1 & +12.1 \\
+BGE-large & $-$2.0 & $-$5.2 & +0.5 & $-$2.2 \\
+\quad $+\method$ & +4.3 & +9.0 & +6.3 & +6.5 \\
+RepLLaMA & +1.1 & $-$9.1 & $-$1.8 & $-$3.3 \\
+\quad $+\method$ & +16.2 & +14.1 & +6.8 & +12.3 \\
+\bottomrule
+\end{tabular}
+\caption{Per-dataset FollowIR results.  The two panels report retrieval
+effectiveness and p-MRR for the same systems; values are percentages
+($\times100$).}
+\label{tab:followir-breakdown}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.2pt}
+\textit{(a) Retrieval effectiveness}\par\smallskip
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Core17} & \textbf{Robust04} &
+\textbf{News21} & \textbf{Score} \\
+\midrule
+RepLLaMA & 23.2 & 25.7 & 22.5 & 23.8 \\
+HyDE & 23.6 & 24.9 & 21.4 & 23.4 \\
+Query2Doc & 25.9 & 26.1 & 24.9 & 25.6 \\
+ConvSearch-R1 & 22.3 & 25.9 & 22.0 & 23.4 \\
+\method{} & 25.9 & 28.2 & 32.1 & 28.7 \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\textit{(b) Instruction sensitivity (p-MRR)}\par\smallskip
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Core17} & \textbf{Robust04} &
+\textbf{News21} & \textbf{Average} \\
+\midrule
+RepLLaMA & +1.1 & $-$9.1 & $-$1.8 & $-$3.3 \\
+HyDE & +6.5 & $-$2.9 & +0.7 & +1.4 \\
+Query2Doc & +8.0 & $-$7.5 & $-$3.8 & $-$1.1 \\
+ConvSearch-R1 & +3.0 & $-$2.5 & +0.2 & +0.2 \\
+\method{} & +16.2 & +14.1 & +6.8 & +12.3 \\
+\bottomrule
+\end{tabular}
+\caption{Per-dataset FollowIR comparison with query rewriting and
+expansion using RepLLaMA.  The two panels report retrieval effectiveness and
+p-MRR; values are percentages ($\times100$).}
+\label{tab:rewrite-breakdown}
+\end{table}
 
 \section{Additional Ablations and Sensitivity}
 \label{app:additional-ablations}
 
 The main text isolates the positive view, residual exclusion signal, reward
-attenuation, and explicit penalty.  The following analyses test whether the
-residual estimator is robust to reasonable alternatives, whether the shared
-configuration is stable, and whether the central paired differences are
-consistent with the aggregate differences reported in the main ablation.
+attenuation, and explicit penalty.  The following results compare alternative
+residual estimators and examine sensitivity to the shared configuration.
 
 \subsection{Estimator and Normalization Choices}
 
-Table~\ref{tab:diagnostic-ablation} audits the robust estimator,
+Table~\ref{tab:diagnostic-ablation} compares the robust estimator,
 normalization, and residual construction used to obtain $r$.
 
-\begin{table*}[htbp]
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{2.2pt}
+\begin{tabular}{p{0.92in}p{1.30in}cc}
+\toprule
+\textbf{Variant} & \textbf{Modification} & \textbf{Score} & \textbf{p-MRR} \\
+\midrule
+Full \method{} & None & 28.7 & $+$12.3 \\
+\method{} w/ OLS & Replace Huber regression & 26.9 & $+$10.6 \\
+\method{} w/ mean/std scaling & Replace median/MAD scaling & 26.8 & $+$8.5 \\
+\method{} w/o residual centering & Omit residual recentering & 27.1 & $+$10.8 \\
+\bottomrule
+\end{tabular}
 \caption{Secondary \method design choices on FollowIR.  Each row changes one
 estimation or normalization choice while retaining the controlled candidate
 set and three evidence views.}
 \label{tab:diagnostic-ablation}
+\end{table}
+
+\begin{table}[t]
 \centering
 \small
+\setlength{\tabcolsep}{3pt}
 \begin{tabular}{llcc}
 \toprule
-\textbf{Variant} & \textbf{Change from \method{}} & \textbf{Score} & \textbf{p-MRR} \\
+\textbf{Analysis} & \textbf{Setting} & \textbf{Score} &
+\textbf{p-MRR} \\
 \midrule
-\method{} & None & 28.4 & $+$12.3 \\
-OLS fit & Replace Huber regression & 24.9 & $+$10.6 \\
-Mean/std scaling & Replace median/MAD scaling & 24.8 & $+$8.5 \\
-Uncentered residual & Omit residual recentering & 24.8 & $+$10.8 \\
+Threshold & $\lambda=0.5$ (default) & 28.7 & $+$12.3 \\
+& $\lambda=1.0$ & 28.3 & $+$11.8 \\
+& $\lambda=1.5$ & 28.1 & $+$9.2 \\
+& $\lambda=2.0$ & 27.8 & $+$7.5 \\
+\addlinespace[2pt]
+Temperature & $\tau=0.1$ (default) & 28.7 & $+$12.3 \\
+& $\tau=0.2$ & 28.2 & $+$11.9 \\
+& $\tau=0.5$ & 27.8 & $+$10.4 \\
+& $\tau=1.0$ & 27.1 & $+$8.7 \\
+\addlinespace[2pt]
+Candidate depth & $K=10$ & 26.3 & $+$18.1 \\
+& $K=50$ & 27.9 & $+$20.8 \\
+& $K=100$ & 28.5 & $+$22.5 \\
+& $K=200$ & 28.4 & $+$22.1 \\
+& $K=1000$ (default) & 28.7 & $+$12.3 \\
+\addlinespace[2pt]
+Query decomposition & Qwen3-4B & \multicolumn{2}{c}{$2.81\mathbin{\pm}1.20$\,s/q} \\
+Post-scoring correction & Cached scores & \multicolumn{2}{c}{$0.4$\,ms/q} \\
 \bottomrule
 \end{tabular}
-\end{table*}
-
-Table~\ref{tab:sensitivity-efficiency} reports whether the shared scoring
-hyperparameters and candidate depth change the main conclusion, together with
-the end-to-end overhead required by decomposition and reranking.
-
-\begin{table*}[htbp]
-\caption{Sensitivity and efficiency.  Score and p-MRR are averaged over
-FollowIR; latency is measured per query under a fixed hardware setting.}
+\caption{Sensitivity and efficiency with RepLLaMA on FollowIR.  Each
+sensitivity block varies one factor while retaining the other defaults
+($K{=}1000$, $\lambda{=}0.5$, and $\tau{=}0.1$).  Candidate depth $K$ jointly
+specifies the number of $\qbase$ candidates retrieved, used for normalization
+and Huber fitting, and reranked before metric computation.  Score and p-MRR are
+averaged over the three FollowIR datasets.  Decomposition latency is measured
+across all FollowIR queries using Qwen3-4B on a single NVIDIA GeForce RTX 3090
+GPU with temperature $0.1$; we report mean $\pm$ standard deviation.  The
+$0.4$ ms measurement covers score normalization, Huber fitting, and final
+reranking after retrieval scores are available.}
 \label{tab:sensitivity-efficiency}
-\centering
-\small
-\begin{tabular}{llcc}
-\toprule
-\textbf{Analysis} & \textbf{Setting} & \textbf{Avg Score} &
-\textbf{Avg p-MRR} \\
-\midrule
-$\lambda=0.5$ & default & 28.4 & $+$12.3 \\
-$\lambda=1.0$ & & 27.6 & $+$10.8 \\
-$\lambda=1.5$ & & 26.9 & $+$9.2 \\
-$\lambda=2.0$ & & 25.8 & $+$7.5 \\
-\addlinespace[2pt]
-$\tau=0.1$ & default & 28.4 & $+$12.3 \\
-$\tau=0.2$ & & 28.2 & $+$11.9 \\
-$\tau=0.5$ & & 27.8 & $+$10.4 \\
-$\tau=1.0$ & & 27.1 & $+$8.7 \\
-\addlinespace[2pt]
-$K=10$ & candidate depth & 26.3 & $+$18.1 \\
-$K=50$ & & 27.9 & $+$20.8 \\
-$K=100$ & default & 28.5 & $+$22.5 \\
-$K=200$ & & 28.4 & $+$22.1 \\
-\addlinespace[2pt]
-Decomposition & One structured LLM call & \multicolumn{2}{c}{0.3\,s / query} \\
-\method reranking & Cached document embeddings & \multicolumn{2}{c}{5\,ms / query} \\
-\bottomrule
-\end{tabular}
-\end{table*}
+\end{table}
 
-\subsection{Statistical Reliability}
-\label{app:statistical-reliability}
+Table~\ref{tab:sensitivity-efficiency} varies one factor at a time around the
+main RepLLaMA configuration.  The $K=1000$ row reproduces the main FollowIR
+result (28.7 Score and $+12.3$ p-MRR), resolving the candidate-depth setting
+used by Tables~\ref{tab:followir-main} and~\ref{tab:followir-full}.  All tested
+depths improve over the RepLLaMA base result of 23.8 Score and $-3.3$ p-MRR,
+although the magnitude is depth-sensitive: Score ranges from 26.3 to 28.7,
+while p-MRR varies non-monotonically from $+12.3$ to $+22.5$.  Because the same
+candidate set is used for retrieval, robust normalization, Huber fitting, and
+reranking, this depth analysis measures the joint effect of all three stages.
+Separating candidate coverage from score-estimation effects requires holding
+retrieval depth fixed while varying the estimation pool.
+In the one-factor parameter sweeps, increasing either $\lambda$ or $\tau$
+reduces both reported metrics relative to the tested defaults.
 
-Because the controlled variants are paired at the query level, we report
-their paired differences in Table~\ref{tab:ablation-confidence}.  All
-differences are computed per query and then averaged, so the reported $\Delta$
-values reflect the mean per-query change rather than the difference of
-collection-level aggregates.
-
-\begin{table*}[htbp]
-\caption{Paired differences for the central component comparisons on FollowIR.}
-\label{tab:ablation-confidence}
-\centering
-\small
-\begin{tabular}{lccc}
-\toprule
-\textbf{Matched comparison} & $\boldsymbol{\Delta}$\textbf{Score} &
-$\boldsymbol{\Delta}$\textbf{p-MRR} \\
-\midrule
-Positive-view scoring vs. full-query baseline & +1.7 & +2.6 \\
-Residual vs. raw exclusion subtraction & +2.6 & $-$2.2 \\
-Full \method{} vs. \method{} w/o reward attenuation & +2.1 & +1.5 \\
-Full \method{} vs. \method{} w/o exclusion penalty & +2.0 & +3.4 \\
-\bottomrule
-\end{tabular}
-\end{table*}
+Instruction decomposition averages $2.81$ seconds per query (standard
+deviation $1.20$, range $1.51$--$6.80$ seconds), corresponding to a throughput
+of $0.36$ decomposition queries per second.  After the three retrieval-score
+channels are available, score normalization, Huber fitting, and final
+reranking take $0.4$ ms per query.  This post-scoring measurement excludes
+query decomposition, query encoding, and candidate retrieval, and therefore is
+not an end-to-end latency measurement.  Among the reported online components,
+latency is dominated by the one-time query decomposition.  \method requires no
+retriever training, document re-encoding, or candidate-level LLM inference;
+its additional LLM cost is one query-level decomposition.
 
 \section{Additional Exclusion-Benchmark Results}
 \label{app:exclusion-benchmarks}
 
 Table~\ref{tab:exclusion-transfer} (main text,
-Section~\ref{sec:exclusion-transfer}) reports the complete \method method
-across NegConstraint and ExcluIR.  To determine whether transfer depends on
-using the per-query regression residual rather than raw exclusion similarity,
-Table~\ref{tab:exclusion-ablation} applies the same matched internal
-comparison to both benchmarks.  All rows use the same frozen retriever,
-candidate set, decomposition, query templates, document embeddings, and shared
-$\lambda,\tau$; the raw and residual correction rows differ only in the
-exclusion signal supplied to the same \method scoring function.
+Section~\ref{sec:exclusion-transfer}) reports the complete \method results
+across NegConstraint and ExcluIR.  Table~\ref{tab:exclusion-ablation} examines
+whether its performance depends on using the per-query regression residual
+instead of raw exclusion similarity.  The same matched comparison is applied
+to both benchmarks.  Within each benchmark, all rows use the same frozen
+retriever, candidate pool, decomposition, query templates, document embeddings,
+and shared $\lambda,\tau$.  The pool contains the top 1,000 candidates for
+NegConstraint and the complete 90,406-document corpus for ExcluIR.  The raw
+and residual correction rows differ only in the exclusion signal supplied to
+the same \method scoring function.
+
+\paragraph{ExcluIR Evaluation Protocol.}
+For an ExcluIR request $u$, let
+$\operatorname{rank}_u(d)\in\{1,\ldots,90{,}406\}$ be the one-based rank of
+document $d$ after reranking the full corpus.  For an annotated desired
+document $d^+$, its top-10 reciprocal-rank contribution is
+$1/\operatorname{rank}_u(d^+)$ when $\operatorname{rank}_u(d^+)\leq10$ and
+zero otherwise; MRR averages this quantity over the evaluation instances.
+For each annotated desired--excluded pair $(d^+,d^-)$, Right Rank is one when
+$\operatorname{rank}_u(d^+)<\operatorname{rank}_u(d^-)$ and zero otherwise;
+RR is its mean over all pairs.  Equal ranks contribute zero.  Full-corpus
+scoring guarantees that neither pair member is missing from the evaluated
+ranking.
+
+\paragraph{Result Provenance.}
+The DEO NegConstraint values in Table~\ref{tab:exclusion-transfer} are taken
+from its source paper, while we reproduce its ExcluIR values under the
+benchmark protocol above.  The SEAL ExcluIR values are taken from its source
+paper.  These rows provide prior-method context; the Base/$+\method$ blocks are
+the matched comparisons used to isolate \method's score correction.
 
 \begin{table}[t]
-\caption{Matched exclusion-signal ablation across exclusion benchmarks with
-BGE-large-en-v1.5.}
-\label{tab:exclusion-ablation}
 \centering
-\scriptsize
-\setlength{\tabcolsep}{2.3pt}
-\begin{tabular}{lcccc}
+\small
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{p{1.18in}cccc}
 \toprule
 \multirow{2}{*}{\textbf{Variant}} &
 \multicolumn{2}{c}{\textbf{NegConstraint}} &
@@ -915,37 +1153,44 @@ BGE-large-en-v1.5.}
 & \textbf{MAP} & \textbf{nDCG@10} & \textbf{MRR} & \textbf{RR} \\
 \midrule
 Full-query baseline & 63.8 & 71.9 & 73.4 & 56.0 \\
-Positive-view scoring & 76.0 & 81.8 & 75.0 & 58.0 \\
-Raw exclusion with \method{} scoring & 76.6 & 81.8 & 76.0 & 60.0 \\
-Residual exclusion with \method{} scoring & 76.6 & 81.8 & 78.2 & 82.2 \\
+\method{} w/ positive view only & 76.0 & 81.8 & 75.0 & 58.0 \\
+\method{} w/ raw exclusion score & 76.6 & 81.8 & 76.0 & 60.0 \\
+Full \method{} & 76.6 & 81.8 & 78.2 & 82.2 \\
 \bottomrule
 \end{tabular}
+\caption{Matched exclusion-signal ablation across exclusion benchmarks with
+BGE-large-en-v1.5.  Within each benchmark, all variants use the same candidate
+pool, generated views, document representations, and scoring hyperparameters.}
+\label{tab:exclusion-ablation}
 \end{table}
 
-Under the same \method scoring rule, the regression residual provides a
-stronger effectiveness--exclusion profile than raw similarity on both
-benchmarks.  This comparison supports transfer of the ranking signal, not
-recovery of the underlying logical semantics.
+The two benchmarks show different contributions from the exclusion signal.
+On NegConstraint, the positive view accounts for most of the gain over the
+full-query baseline: it raises MAP from 63.8 to 76.0 and nDCG@10 from 71.9 to
+81.8.  Raw exclusion scoring adds 0.6 MAP points and no nDCG@10 gain, while
+replacing it with the residual leaves both reported metrics unchanged at 76.6
+and 81.8.  On ExcluIR, the residual correction improves over raw exclusion
+scoring from 76.0 to 78.2 MRR and from 60.0 to 82.2 RR.  Thus, in this matched
+comparison, residualization contributes most clearly to the desired--excluded
+pair ordering measured by ExcluIR, whereas the NegConstraint improvement is
+driven primarily by the positive view.
 
 \section{Qualitative Analysis}
 \label{app:qualitative}
 
 The qualitative analysis contains one representative success and one
-semantic-entanglement failure from FollowIR (Core17) with RepLLaMA.
+weak-exclusion-signal failure from FollowIR (Core17) with RepLLaMA.
 Each case reports the benchmark, query ID, complete request,
 decomposed views, candidate scores, and the ranking change.  The success case is the query with the largest
 single-document rank drop; the failure case is the query with the
 smallest rank change among those carrying an exclusion instruction.
 
 \begin{table*}[t]
-\caption{Representative \method cases from FollowIR Core17 with RepLLaMA.
-Each case reports the operational views, score-space evidence, and ranking
-change under the complete scoring rule.}
-\label{tab:qualitative-cases}
 \centering
-\scriptsize
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{p{0.15\textwidth}p{0.22\textwidth}p{0.25\textwidth}p{0.24\textwidth}}
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{p{0.10\textwidth}p{0.26\textwidth}p{0.25\textwidth}p{0.27\textwidth}}
 \toprule
 \textbf{Outcome} & \textbf{Request and views} & \textbf{Candidate evidence} &
 \textbf{Ranking effect and interpretation} \\
@@ -955,11 +1200,11 @@ Success &
   \newline Query: ``Identify documents discussing the development and application of space-borne ocean remote sensing''
   \newline Exclusion: land-bound sciences, agriculture, forestry, marketing, temperature
   \newline Views: $\qbase$ (full query), $\qpos$ (ocean remote sensing in oceanography, seabed prospecting, marine sciences), $\qneg$ (land-bound sciences, agriculture, forestry, marketing, temperature) &
-  Original top-1 doc ($s_{\text{full}}=0.725$) scores high on both $s_{\text{pos}}$ and $s_{\text{neg}}$ channels (agriculture/forestry content).  Residual $r$ separates the exclusion signal from shared marine-science relevance.
+  Original top-1 doc ($s_{\text{full}}=0.725$) scores high on both $s_{\text{pos}}$ and $s_{\text{neg}}$ channels (agriculture/forestry content).  Residual $r$ remains high after accounting for their shared score variation.
   \newline After \method: top-1 score rises to $1.907$ for ocean-only doc; land-bound doc drops to rank 580. &
   Land-bound/agriculture documents drop from top-10 to rank $>500$.
   \newline Ocean remote-sensing documents rise to top-5.
-  \newline \textbf{Interpretation:} Residual penalty correctly identifies exclusion signal when exclusion and target content are topically distinct. \\
+  \newline \textbf{Interpretation:} \method{} uses the high residual to suppress the excluded content in this candidate set. \\
 
 Failure &
   Benchmark: FollowIR (Core17), QID 310
@@ -972,6 +1217,10 @@ Failure &
   \newline \textbf{Interpretation:} When the exclusion term rarely co-occurs with the target in the candidate set, the residual is too small to trigger a penalty---the failure mode is low negative-channel signal rather than semantic entanglement. \\
 \bottomrule
 \end{tabular}
+\caption{Representative \method cases from FollowIR Core17 with RepLLaMA.
+Each case reports the operational views, score-space evidence, and ranking
+change under the complete scoring rule.}
+\label{tab:qualitative-cases}
 \end{table*}
 
 \section{Decomposition and Reproducibility Details}
@@ -983,48 +1232,53 @@ structured affirmative and exclusion content in one generation.  The full
 view $\qbase$ is the original request itself, used unchanged for candidate
 generation; $\qpos$ retains the topic and affirmative conditions while removing
 exclusion content, and $\qneg$ contains the excluded content, or
-\textnormal{[NONE]} when no exclusion is present.  We use the fixed
-\texttt{TSC\_BALANCED\_t01} prompt with temperature $0.1$, top-$p=0.9$, at most
+\textnormal{[NONE]} when no exclusion is present.  We use the fixed prompt with temperature $0.1$, top-$p=0.9$, at most
 512 new tokens, and thinking disabled.  Malformed or missing fields are mapped
 to the corresponding empty view.  The system prompt is:
-{\scriptsize
+{\footnotesize
 \begin{verbatim}
-You are an expert IR query optimizer for Dense
-Vector Models. Decouple "Original Query" and
-"Instruction" into Q_plus and Q_minus.
+You are an expert IR query optimizer
+for Dense Vector Models. Decouple
+"Original Query" and "Instruction"
+into Q_plus and Q_minus.
 
-Q_plus rules: (1) Fluent natural language phrase,
-not a keyword list. (2) Semantic topic only;
-remove format noise ("articles", "documents",
-"reports"). (3) Remove conversational connectors
-("such as", "including"). (4) Sharp, coherent.
+Q_plus rules: (1) Fluent natural
+language phrase, not a keyword list.
+(2) Semantic topic only; remove format
+noise ("articles", "documents",
+"reports"). (3) Remove conversational
+connectors ("such as", "including").
+(4) Sharp, coherent.
 
-Q_minus rules: (1) Extract only critical
-high-level exclusion concepts. (2) Concise
-natural phrasing. (3) If no exclusion,
-output "[NONE]".
+Q_minus rules: (1) Extract only
+critical high-level exclusion concepts.
+(2) Concise natural phrasing.
+(3) If no exclusion, output "[NONE]".
 
-No-negation rule: DENSE RETRIEVERS IGNORE LOGIC
-WORDS. NEVER use negation in Q_minus ("no",
-"not", "non-", "without"). Convert negations to
+No-negation rule: DENSE RETRIEVERS
+IGNORE LOGIC WORDS. NEVER use negation
+in Q_minus ("no", "not", "non-",
+"without"). Convert negations to
 AFFIRMATIVE entities:
   BAD: "non-United Kingdom"
   -> GOOD: "United States, France, global"
   BAD: "violence outside Ireland"
-  -> GOOD: "violence in England, international"
+  -> GOOD: "violence in England,
+     international"
 Output ONLY exact entities to exclude.
 
 Output JSON:
 {
-  "Reasoning_Steps": "1. Core topic. 2. Filter
-    noise. 3. Exclusions (negations->affirm).",
+  "Reasoning_Steps": "1. Core topic.
+    2. Filter noise. 3. Exclusions
+    (negations->affirm).",
   "Q_plus": "Fluent natural language query",
   "Q_minus": "Core exclusions or [NONE]"
 }
 \end{verbatim}
 }
 The user prompt template is:
-{\scriptsize
+{\footnotesize
 \begin{verbatim}
 Decouple into Q_plus and Q_minus:
 Query: "{query}"
@@ -1032,19 +1286,73 @@ Instruction: "{instruction}"
 \end{verbatim}
 }
 
-All document representations are computed once with the base retriever's
-document template, and all three query views use its query template.  For
-numerical stability, Huber residuals and channel scores use a
-$10^{-6}$ floor in their median/MAD normalization.  The regression is fit
-independently on each candidate set and uses no relevance labels.  The
-scoring hyperparameters $\lambda$ and $\tau$ are fixed before evaluation and
-shared across datasets and retrievers; no query-specific tuned coefficients or
-metric-based tuning are introduced.  The released configuration records
-these constants and the candidate-set depth for each experiment.
+For every backbone, including RepLLaMA, all document representations are
+computed once with that retriever's native document template, and all three
+query views use its native query template.  Matched Base/$+\method$ variants
+reuse the same candidates, templates, and document representations.  The
+$K_{\mathrm{retrieve}}=K_{\mathrm{fit}}=K_{\mathrm{rerank}}=1000$ convention
+in Section~\ref{sec:evaluation-overview} applies to the reported FollowIR,
+NegConstraint, and BEIR results.  ExcluIR uses the complete 90,406-document
+corpus as $\mathcal C_u$ for score normalization, Huber fitting, and reranking.
 
-% ============================================================
-% REFERENCES
-% ============================================================
-\bibliography{references}
+\paragraph{Numerical and Scoring Constants.}
+We set the Huber transition point to $\delta=1.35$ in standardized score units.
+The constant $\epsilon=10^{-6}$ serves both as the median/MAD denominator
+floor and as the low-dispersion threshold: when
+$\operatorname{MAD}(S_{\mathrm{pos}})<\epsilon$, the fitted slope is set to
+zero.  The regression is fit independently on each candidate set and uses no
+relevance labels.  We use $\lambda=0.5$ and $\tau=0.1$ as global heuristic
+constants defined on the standardized residual scale and fix them across
+datasets and retrievers without per-dataset or per-retriever tuning.  Because
+$r$ is centered and scaled by its within-query MAD, $\lambda=0.5$ activates
+the correction half a residual-MAD unit above the median fitted deviation.
+With $\tau=0.1$, each additional $0.1$ active residual unit multiplies the
+affirmative reward by $\exp(-1)$.  The full-query score, attenuated affirmative
+reward, and residual penalty use unit coefficients; no query-specific scoring
+weights are introduced.
+
+\section{General Retrieval Evaluation}
+\label{app:beir}
+
+To assess whether \method{} affects general retrieval effectiveness, we compare
+the frozen BGE-large-en-v1.5 baseline with its \method-reranked results on eight
+BEIR benchmarks.
+
+Table~\ref{tab:beir-results} reports nDCG@10 and MAP@100 for each dataset.
+\method{} maintains general retrieval effectiveness overall: five datasets
+improve in nDCG@10 (+0.05 to +2.17 points), while three show small decreases
+($-$0.12 to $-$1.03 points).  The average changes are +0.19 nDCG@10 and
+$-$0.04 MAP@100.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Dataset} & \textbf{nDCG@10} & \textbf{$\Delta$} &
+\textbf{MAP@100} & \textbf{$\Delta$} \\
+\midrule
+trec-covid & \textbf{71.37} & \textbf{+2.17} & \textbf{8.71} & \textbf{+0.20} \\
+fiqa & \textbf{42.42} & \textbf{+0.73} & \textbf{36.34} & \textbf{+0.63} \\
+hotpotqa & \textbf{73.29} & \textbf{+0.08} & \textbf{66.05} & \textbf{+0.02} \\
+nq & \textbf{51.03} & \textbf{+0.05} & \textbf{44.02} & \textbf{+0.04} \\
+nfcorpus & \textbf{36.53} & \textbf{+0.05} & \textbf{17.68} & \textbf{+0.17} \\
+scifact & 74.07 & $-$0.12 & 69.78 & $-$0.12 \\
+arguana & 45.87 & $-$0.42 & 32.80 & $-$0.26 \\
+quora & 87.17 & $-$1.03 & 83.91 & $-$1.19 \\
+\midrule
+\textbf{Average} & \textbf{60.22} & \textbf{+0.19} & \textbf{44.19} & $-$0.04 \\
+\bottomrule
+\end{tabular}
+\caption{BEIR evaluation with BGE-large and \method{}.  Values are percentages
+($\times100$).  $\Delta$ shows absolute change relative to the BGE-large
+baseline.}
+\label{tab:beir-results}
+\end{table}
+
+Across the eight datasets, \method{} preserves average general retrieval
+performance, improving nDCG@10 by 0.19 points while MAP@100 changes by only
+$-$0.04 points.  NQ and HotpotQA show nDCG@10 changes of at most 0.08 points.
 
 \end{document}

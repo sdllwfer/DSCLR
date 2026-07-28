@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = "dataset/NegConstraint/NegConstraint"
 DUAL_QUERIES_PATH = "dataset/NegConstraint/NegConstraint/dual_queries/NegConstraint_TSC_BALANCED_t01.jsonl"
 
-CANDIDATE_DEPTH = 100  # Top-K candidates per query
+CANDIDATE_DEPTH = 1000  # Top-K candidates per query
 
 # Import TRACE scoring components
 from eval.engine_trace import TRACEEvaluator, robust_standardize, _mean_std_standardize, _mad, fit_huber_regression

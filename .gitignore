@@ -70,3 +70,9 @@ refs/
 
 # Paper temporary directories
 paper/模拟评审/
+
+# Trae IDE documents
+.trae/documents/
+
+# Logs
+logs/

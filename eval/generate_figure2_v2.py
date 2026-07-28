@@ -21,129 +21,8 @@ import matplotlib.pyplot as plt
 
 # ======== Paths ========
 
-SCATTER_DATA_PATH = "/home/luwa/Documents/DSCLR-remote/results/figure2/figure2_scatter_data.json"
-OUTPUT_PATH = "/home/luwa/Documents/DSCLR-remote/paper/AuthorKit27/AuthorKit27/Figures/figure2_adjusted.pdf"
-
-# ======== Legend labels (intuitive, matching paper narrative) ========
-LABEL_SATISFYING = "Relevant doc"
-LABEL_AFFECTED = "Excluded doc"
-LABEL_OTHER = "Other candidates"
-
-# ======== Manual z_neg adjustments for satisfying docs ========
-# Lower z_neg for some satisfying docs so more blue points fall below
-# the Huber baseline in the left panel and below r=0 in the right panel.
-ZNEG_OVERRIDES = {
-    # Intentionally scatter a subset of satisfying docs away from the fitted
-    # baseline. Values are deliberately non-uniform so the blue points do not
-    # line up along a single diagonal. z_neg values span a wide vertical
-    # range (-1.5 to +0.5) with gaps.
-    "1403327_4": -1.50,   # far below baseline
-    "621835_0":  -1.20,
-    "1074033_0": -0.90,
-    "284453_1":  -0.55,
-    "1743812_0": -0.20,
-    "392356_1":   0.10,   # near baseline
-    "24413_0":   -0.35,
-    "306279_5":   0.25,
-    "1492130_1": -0.65,
-    "868394_1":   0.45,
-    "1456303_1": -0.10,
-    "706916_0":   0.50,
-    # Additional overrides to move 3 more satisfying docs below the baseline
-    "566358_3":  -1.00,
-    "1513114_3": -0.80,
-    "1034911_0": -0.70,
-}
-
-
-def _mad(x, eps=1e-6):
-    return np.median(np.abs(x - np.median(x))) + eps
-
-
-def fit_huber_regression(y, X, delta=1.345, max_iter=300, tol=1e-6):
-    """Huber regression (same algorithm as generate_figure2_data.py)."""
-    n = len(y)
-    if n < 2:
-        return float(np.mean(y)), 0.0
-    X_mean = np.mean(X)
-    y_mean = np.mean(y)
-    Xc = X - X_mean
-    Yc = y - y_mean
-    ss_xx = np.sum(Xc ** 2)
-    if ss_xx < 1e-12:
-        return float(y_mean), 0.0
-    b = np.sum(Xc * Yc) / ss_xx
-    a = y_mean - b * X_mean
-
-    for _ in range(max_iter):
-        resid = y - a - b * X
-        sigma = max(np.median(np.abs(resid)) / 0.6745, 1e-6)
-        u = resid / (sigma * delta)
-        w = np.where(np.abs(u) <= 1.0, 1.0, 1.0 / np.abs(u))
-
-        wx = w * X
-        wy = w * y
-        wxx = np.sum(wx * X)
-        wxy = np.sum(wx * wy)
-        wxs = np.sum(wx)
-        wys = np.sum(wy)
-        ws = np.sum(w)
-
-        denom = ws * wxx - wxs * wxs
-        if abs(denom) < 1e-12:
-            break
-
-        b_new = (ws * wxy - wxs * wys) / denom
-        a_new = (wys - b_new * wxs) / ws
-
-        if abs(a_new - a) < tol and abs(b_new - b) < tol:
-            a, b = a_new, b_new
-            break
-        a, b = a_new, b_new
-
-    return float(a), float(b)
-
-
-def apply_overrides_and_refit(data):
-    """Apply manual z_neg overrides and recompute Huber fit + residuals."""
-    candidates = data["candidates"]
-    n = len(candidates)
-
-    # Apply overrides
-    override_count = 0
-    for c in candidates:
-        if c["doc_id"] in ZNEG_OVERRIDES and c["category"] == "constraint_satisfying":
-            new_z_neg = ZNEG_OVERRIDES[c["doc_id"]]
-            print(f"  Override {c['doc_id']}: z_neg {c['z_neg']:.3f} -> {new_z_neg:.3f}")
-            c["z_neg"] = new_z_neg
-            override_count += 1
-    print(f"Applied {override_count} z_neg overrides.")
-
-    # Recompute Huber fit
-    all_z_pos = np.array([c["z_pos"] for c in candidates])
-    all_z_neg = np.array([c["z_neg"] for c in candidates])
-    a_hat, b_hat = fit_huber_regression(all_z_neg, all_z_pos)
-
-    # Recompute residuals
-    e = all_z_neg - a_hat - b_hat * all_z_pos
-    e_median = np.median(e)
-    e_mad = _mad(e)
-    r = (e - e_median) / e_mad
-
-    for i, c in enumerate(candidates):
-        c["r"] = float(r[i])
-
-    data["huber_a"] = a_hat
-    data["huber_b"] = b_hat
-
-    # Report
-    satisfying = [c for c in candidates if c["category"] == "constraint_satisfying"]
-    sat_r_pos = sum(1 for c in satisfying if c["r"] > 0)
-    sat_r_neg = sum(1 for c in satisfying if c["r"] <= 0)
-    print(f"Satisfying docs: {sat_r_pos} above baseline, {sat_r_neg} at/below baseline")
-    print(f"Huber fit: a={a_hat:.4f}, b={b_hat:.4f}")
-
-    return data
+SCATTER_DATA_PATH = "/home/luwa/Documents/DSCLR-remote/results/figure2/figure2_v2_scatter_data.json"
+OUTPUT_PATH = "/home/luwa/Documents/DSCLR-remote/paper/AuthorKit27/AuthorKit27/Figures/figure2_v2.pdf"
 
 
 def _compute_stats(data):
@@ -172,8 +51,12 @@ def _compute_stats(data):
         r_affected = np.array([c["r"] for _, c in affected])
         r_satisfying = np.array([c["r"] for _, c in satisfying])
 
+        # Pairwise mispenalty rate: over all (satisfying, affected) pairs,
+        # the fraction where the satisfying doc has a higher exclusion score
+        # (i.e., is more penalized) than the affected doc.
+        # Higher exclusion score -> more penalized -> should not happen for satisfying docs
         n_pairs = len(zneg_satisfying) * len(zneg_affected)
-        zneg_pairs = zneg_satisfying[:, None] > zneg_affected[None, :]
+        zneg_pairs = zneg_satisfying[:, None] > zneg_affected[None, :]  # (n_sat, n_aff)
         r_pairs = r_satisfying[:, None] > r_affected[None, :]
         mispenalty_zneg = float(zneg_pairs.sum() / n_pairs)
         mispenalty_r = float(r_pairs.sum() / n_pairs)
@@ -187,10 +70,16 @@ def _compute_stats(data):
 
 
 def plot_left_panel(ax, data):
-    """Plot z_pos-z_neg scatter with Huber fit and residual annotations."""
+    """Plot z_pos-z_neg scatter with fitted relation and residual annotations."""
     candidates = data["candidates"]
-    a_hat = data["huber_a"]
-    b_hat = data["huber_b"]
+
+    # Recompute a robust fitted relation (OLS on central 90% of data)
+    all_z_pos_arr = np.array([c["z_pos"] for c in candidates])
+    all_z_neg_arr = np.array([c["z_neg"] for c in candidates])
+    low_p, high_p = np.percentile(all_z_pos_arr, [5, 95])
+    mask = (all_z_pos_arr >= low_p) & (all_z_pos_arr <= high_p)
+    A = np.vstack([all_z_pos_arr[mask], np.ones(mask.sum())]).T
+    b_hat, a_hat = np.linalg.lstsq(A, all_z_neg_arr[mask], rcond=None)[0]
 
     # Separate by category
     satisfying = [c for c in candidates if c["category"] == "constraint_satisfying"]
@@ -202,8 +91,7 @@ def plot_left_panel(ax, data):
         ax.scatter(
             [c["z_pos"] for c in other],
             [c["z_neg"] for c in other],
-            c="#B0B0B0", s=30, alpha=0.5, zorder=2, edgecolors='none',
-            label=LABEL_OTHER,
+            c="#B0B0B0", s=18, alpha=0.5, zorder=2, edgecolors='none',
         )
 
     # Plot constraint-satisfying (blue)
@@ -211,8 +99,8 @@ def plot_left_panel(ax, data):
         ax.scatter(
             [c["z_pos"] for c in satisfying],
             [c["z_neg"] for c in satisfying],
-            c="#4472C4", s=45, alpha=0.85, zorder=3, edgecolors='white',
-            linewidths=0.5, label=LABEL_SATISFYING,
+            c="#4472C4", s=28, alpha=0.85, zorder=3, edgecolors='white',
+            linewidths=0.3, label="Relevant, keep",
         )
 
     # Plot constraint-affected (red triangles)
@@ -220,8 +108,8 @@ def plot_left_panel(ax, data):
         ax.scatter(
             [c["z_pos"] for c in affected],
             [c["z_neg"] for c in affected],
-            c="#C0504D", s=55, alpha=0.9, zorder=4, marker="^",
-            edgecolors='white', linewidths=0.5, label=LABEL_AFFECTED,
+            c="#C0504D", s=36, alpha=0.9, zorder=4, marker="^",
+            edgecolors='white', linewidths=0.3, label="Relevant, exclude",
         )
 
     # Huber fit line
@@ -229,8 +117,8 @@ def plot_left_panel(ax, data):
     x_min, x_max = min(all_z_pos), max(all_z_pos)
     x_line = np.linspace(x_min - 0.3, x_max + 0.3, 100)
     y_line = a_hat + b_hat * x_line
-    ax.plot(x_line, y_line, 'k--', linewidth=1.8, alpha=0.7, zorder=5,
-            label=r"Fitted baseline")
+    ax.plot(x_line, y_line, 'k--', linewidth=1.2, alpha=0.7, zorder=5,
+            label=r"Fitted relation")
 
     # Annotate residuals for affected candidates (pick up to 3 with largest residuals)
     if affected:
@@ -241,13 +129,14 @@ def plot_left_panel(ax, data):
             # Draw vertical arrow from fit line to point
             ax.annotate(
                 "", xy=(z_p, z_n), xytext=(z_p, y_pred),
-                arrowprops=dict(arrowstyle="->", color="#C0504D", lw=1.5, shrinkA=0, shrinkB=0),
+                arrowprops=dict(arrowstyle="->", color="#C0504D", lw=1.0, shrinkA=0, shrinkB=0),
                 zorder=6,
             )
 
-    ax.set_xlabel(r"$z_{\mathrm{pos}}$", fontsize=16)
-    ax.set_ylabel(r"$z_{\mathrm{neg}}$", fontsize=16)
-    ax.tick_params(labelsize=13, width=1.2, length=5)
+    ax.set_xlabel(r"$z_{\mathrm{pos}}$", fontsize=10)
+    ax.set_ylabel(r"$z_{\mathrm{neg}}$", fontsize=10)
+    ax.legend(fontsize=7, loc="upper left", framealpha=0.9, handletextpad=0.4)
+    ax.tick_params(labelsize=8)
 
     # Subtle grid
     ax.grid(True, alpha=0.15, linewidth=0.5)
@@ -257,12 +146,11 @@ def plot_left_panel(ax, data):
     all_z_neg_arr = np.array([c["z_neg"] for c in candidates])
     pearson = np.corrcoef(all_z_pos_arr, all_z_neg_arr)[0, 1]
     ax.text(0.97, 0.03, f"Pearson $r$ = {pearson:.2f}",
-            transform=ax.transAxes, fontsize=13, ha='right', va='bottom',
+            transform=ax.transAxes, fontsize=8, ha='right', va='bottom',
             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
 
-    qid = data.get("qid_base", data.get("qid_changed", ""))
-    title_text = r"Raw: $z_{\mathrm{neg}}$ vs $z_{\mathrm{pos}}$ (qid " + qid.replace('-changed', '') + ")"
-    ax.set_title(title_text, fontsize=14, pad=8)
+    ax.set_title(r"Raw: $z_{\mathrm{neg}}$ vs $z_{\mathrm{pos}}$",
+                 fontsize=9, pad=4)
 
 
 def plot_right_panel(ax, data):
@@ -279,8 +167,7 @@ def plot_right_panel(ax, data):
         ax.scatter(
             [c["z_pos"] for c in other],
             [c["r"] for c in other],
-            c="#B0B0B0", s=30, alpha=0.5, zorder=2, edgecolors='none',
-            label=LABEL_OTHER,
+            c="#B0B0B0", s=18, alpha=0.5, zorder=2, edgecolors='none',
         )
 
     # Plot constraint-satisfying (blue)
@@ -288,8 +175,8 @@ def plot_right_panel(ax, data):
         ax.scatter(
             [c["z_pos"] for c in satisfying],
             [c["r"] for c in satisfying],
-            c="#4472C4", s=45, alpha=0.85, zorder=3, edgecolors='white',
-            linewidths=0.5, label=LABEL_SATISFYING,
+            c="#4472C4", s=28, alpha=0.85, zorder=3, edgecolors='white',
+            linewidths=0.3, label="Relevant, keep",
         )
 
     # Plot constraint-affected (red triangles)
@@ -297,19 +184,19 @@ def plot_right_panel(ax, data):
         ax.scatter(
             [c["z_pos"] for c in affected],
             [c["r"] for c in affected],
-            c="#C0504D", s=55, alpha=0.9, zorder=4, marker="^",
-            edgecolors='white', linewidths=0.5, label=LABEL_AFFECTED,
+            c="#C0504D", s=36, alpha=0.9, zorder=4, marker="^",
+            edgecolors='white', linewidths=0.3, label="Relevant, exclude",
         )
 
     # Zero line (residuals should be centered around 0)
     all_z_pos = [c["z_pos"] for c in candidates]
     x_min, x_max = min(all_z_pos), max(all_z_pos)
-    ax.axhline(y=0, color='k', linestyle='--', linewidth=1.5, alpha=0.5, zorder=1,
-               label="Fitted baseline")
+    ax.axhline(y=0, color='k', linestyle='--', linewidth=1.0, alpha=0.5, zorder=1)
 
-    ax.set_xlabel(r"$z_{\mathrm{pos}}$", fontsize=16)
-    ax.set_ylabel(r"$r$", fontsize=16)
-    ax.tick_params(labelsize=13, width=1.2, length=5)
+    ax.set_xlabel(r"$z_{\mathrm{pos}}$", fontsize=10)
+    ax.set_ylabel(r"$r$", fontsize=10)
+    ax.legend(fontsize=7, loc="upper left", framealpha=0.9, handletextpad=0.4)
+    ax.tick_params(labelsize=8)
 
     # Subtle grid
     ax.grid(True, alpha=0.15, linewidth=0.5)
@@ -319,11 +206,11 @@ def plot_right_panel(ax, data):
     all_r_arr = np.array([c["r"] for c in candidates])
     pearson = np.corrcoef(all_z_pos_arr, all_r_arr)[0, 1]
     ax.text(0.97, 0.03, f"Pearson $r$ = {pearson:.2f}",
-            transform=ax.transAxes, fontsize=13, ha='right', va='bottom',
+            transform=ax.transAxes, fontsize=8, ha='right', va='bottom',
             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
 
     ax.set_title(r"Residualized: $r$ vs $z_{\mathrm{pos}}$",
-                 fontsize=14, pad=8)
+                 fontsize=9, pad=4)
 
 
 def main():
@@ -336,10 +223,6 @@ def main():
     with open(SCATTER_DATA_PATH, 'r') as f:
         scatter_data = json.load(f)
 
-    # Apply manual z_neg overrides and recompute Huber fit + residuals
-    print("Applying z_neg overrides and recomputing fit...")
-    scatter_data = apply_overrides_and_refit(scatter_data)
-
     # Compute and print statistics for paper TBD values
     print("=" * 50)
     print("Statistics for Mechanism Analysis section:")
@@ -348,18 +231,12 @@ def main():
     print("=" * 50)
 
     # Create figure
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 4.0))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(6.5, 2.8))
 
     plot_left_panel(ax1, scatter_data)
     plot_right_panel(ax2, scatter_data)
 
-    # Shared legend below the two subplots
-    handles, labels = ax1.get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=14,
-               framealpha=0.9, handletextpad=0.5, columnspacing=1.5,
-               bbox_to_anchor=(0.5, -0.02))
-
-    plt.tight_layout(w_pad=2.0, rect=[0, 0.10, 1, 1])
+    plt.tight_layout(w_pad=2.0)
 
     # Save
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)

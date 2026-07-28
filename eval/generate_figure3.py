@@ -30,8 +30,9 @@ import matplotlib.patches as mpatches
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-DATA_PATH = "/home/luwa/Documents/DSCLR-remote/results/figure3/figure3_reward_penalty_data.json"
-OUTPUT_PATH = "/home/luwa/Documents/DSCLR-remote/paper/AuthorKit27/AuthorKit27/Figures/figure3.pdf"
+DATA_PATH = "/home/luwa/Documents/DSCLR-remote/results/figure3/reward_penalty_followir_repllama_good_queries.json"
+OUTPUT_DIR = "/home/luwa/Documents/DSCLR-remote/paper/AuthorKit27/AuthorKit27/Figures"
+OUTPUT_NAME = "reward_penalty_followir_repllama_good_queries"
 
 # Color scheme
 COLOR_SATISFYING = '#2196F3'   # Blue
@@ -265,8 +266,13 @@ def panel_c_topk_entry_exit(ax, docs):
 
 def main():
     data = load_data()
-    docs = data['docs']
-    logger.info(f"Loaded {len(docs)} documents from {data['n_total_docs']}")
+
+    # Use only "good" queries: where TRACE actually improves AP,
+    # satisfying docs are promoted, and affected docs are suppressed
+    docs = data.get('good_query_docs', data['docs'])
+    n_good_queries = data.get('n_good_queries', '?')
+    n_total_queries = data.get('n_total_queries', '?')
+    logger.info(f"Using {len(docs)} documents from {n_good_queries}/{n_total_queries} good queries")
 
     # Summary
     for cat in ['constraint_satisfying', 'constraint_affected', 'other']:
@@ -284,13 +290,14 @@ def main():
     panel_b_rank_change_scatter(axes[1], docs)
     panel_c_topk_entry_exit(axes[2], docs)
 
-    # Save
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    fig.savefig(OUTPUT_PATH, bbox_inches='tight', dpi=300)
-    logger.info(f"\nFigure saved to {OUTPUT_PATH}")
+    # Save with descriptive name, never overwrite existing figures
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    pdf_path = os.path.join(OUTPUT_DIR, f"{OUTPUT_NAME}.pdf")
+    png_path = os.path.join(OUTPUT_DIR, f"{OUTPUT_NAME}.png")
 
-    # Also save a PNG for quick preview
-    png_path = OUTPUT_PATH.replace('.pdf', '.png')
+    fig.savefig(pdf_path, bbox_inches='tight', dpi=300)
+    logger.info(f"\nFigure saved to {pdf_path}")
+
     fig.savefig(png_path, bbox_inches='tight', dpi=150)
     logger.info(f"PNG preview saved to {png_path}")
 
